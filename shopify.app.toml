@@ -7,7 +7,6 @@ embedded = true
 
 [build]
 automatically_update_urls_on_dev = true
-include_config_on_deploy = true
 
 [webhooks]
 api_version = "2026-01"
@@ -26,5 +25,5 @@ scopes = "write_products"
 
 [auth]
 redirect_urls = [ "https://lego-importer-3esc.onrender.com/auth/callback",
-"https://lego-importer-3esc.onrender.com/auth/shopify/callback",
-"https://lego-importer-3esc.onrender.com/api/auth/callback" ]
+"https://lego-importer-3esc.onrender.com/auth/shopify/callback"
+]
