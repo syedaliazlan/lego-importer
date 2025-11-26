@@ -2,7 +2,7 @@
 
 client_id = "c6107f100011bfd23b0f04a1e4c42152"
 name = "lego-importer"
-application_url = "https://example.com"
+application_url = "https://lego-importer-3esc.onrender.com/"
 embedded = true
 
 [build]
@@ -25,4 +25,6 @@ api_version = "2026-01"
 scopes = "write_products"
 
 [auth]
-redirect_urls = [ "https://example.com/api/auth" ]
+redirect_urls = [ "https://lego-importer-3esc.onrender.com/auth/callback",
+"https://lego-importer-3esc.onrender.com/auth/shopify/callback",
+"https://lego-importer-3esc.onrender.com/api/auth/callback" ]
