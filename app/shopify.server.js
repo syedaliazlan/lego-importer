@@ -4,8 +4,12 @@ import {
   AppDistribution,
   shopifyApp,
 } from "@shopify/shopify-app-react-router/server";
-import { PrismaSessionStorage } from "@shopify/shopify-app-session-storage-prisma";
-import prisma from "./db.server";
+// 1. Import Redis Storage
+import { RedisSessionStorage } from "@shopify/shopify-app-session-storage-redis";
+
+// 2. Remove the Prisma imports (commented out below for reference)
+// import { PrismaSessionStorage } from "@shopify/shopify-app-session-storage-prisma";
+// import prisma from "./db.server";
 
 const shopify = shopifyApp({
   apiKey: process.env.SHOPIFY_API_KEY,
@@ -14,7 +18,11 @@ const shopify = shopifyApp({
   scopes: process.env.SCOPES?.split(","),
   appUrl: process.env.SHOPIFY_APP_URL || "",
   authPathPrefix: "/auth",
-  sessionStorage: new PrismaSessionStorage(prisma),
+  
+  // 3. Update sessionStorage to use Redis
+  // Ensure you have REDIS_URL set in your environment variables
+  sessionStorage: new RedisSessionStorage(process.env.REDIS_URL),
+  
   distribution: AppDistribution.AppStore,
   ...(process.env.SHOP_CUSTOM_DOMAIN
     ? { customShopDomains: [process.env.SHOP_CUSTOM_DOMAIN] }
