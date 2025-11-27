@@ -4,18 +4,8 @@ import { AppProvider } from "@shopify/shopify-app-react-router/react";
 import { authenticate } from "../shopify.server";
 
 export const loader = async ({ request }) => {
-  console.log("[App] Checking authentication...");
-  
-  try {
-    await authenticate.admin(request);
-    console.log("[App] Authentication check passed");
-  } catch (error) {
-    console.error("[App] Authentication failed:", error.message);
-    console.error("[App] Error details:", error);
-    throw error;
-  }
+  await authenticate.admin(request);
 
-  // eslint-disable-next-line no-undef
   return { apiKey: process.env.SHOPIFY_API_KEY || "" };
 };
 

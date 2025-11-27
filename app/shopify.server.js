@@ -4,7 +4,6 @@ import {
   AppDistribution,
   shopifyApp,
 } from "@shopify/shopify-app-react-router/server";
-// Switch back to Prisma
 import { PrismaSessionStorage } from "@shopify/shopify-app-session-storage-prisma";
 import prisma from "./db.server";
 
@@ -15,10 +14,7 @@ const shopify = shopifyApp({
   scopes: process.env.SHOPIFY_API_SCOPES?.split(","),
   appUrl: process.env.SHOPIFY_APP_URL || "",
   authPathPrefix: "/auth",
-  
-  // Use Prisma with PostgreSQL instead of Redis
   sessionStorage: new PrismaSessionStorage(prisma),
-  
   distribution: AppDistribution.SingleMerchant,
   ...(process.env.SHOP_CUSTOM_DOMAIN
     ? { customShopDomains: [process.env.SHOP_CUSTOM_DOMAIN] }
