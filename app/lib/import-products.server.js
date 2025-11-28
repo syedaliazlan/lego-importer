@@ -44,6 +44,9 @@ export async function importSets(auth, ids, env) {
 
   // Get all available sales channels once
   const availableChannels = await getAvailableChannels(admin);
+  
+  // Category ID for "Construction Set Toys" from Shopify Standard Product Taxonomy
+  const categoryId = "gid://shopify/TaxonomyCategory/tg-5-7-8";
 
   for (const rawId of ids) {
     const setNum = String(rawId || "").trim();
@@ -183,6 +186,7 @@ export async function importSets(auth, ids, env) {
         descriptionHtml,
         vendor: set.theme || env.DEFAULT_VENDOR || "LEGO", // Use theme as vendor
         productType: "Sets", // Fixed to "Sets" as requested
+        category: categoryId, // "Construction Set Toys" category ID
         status: "DRAFT",
         tags,
         metafields,

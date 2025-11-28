@@ -1,0 +1,1 @@
+Your job is to run a git add . (all files) or unstaged files and then run a git commit with a short descriptive message explaining the changes for this commit. Finally run git push. Always use github cli.
