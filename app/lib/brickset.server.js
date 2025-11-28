@@ -74,8 +74,15 @@ export async function fetchSet(setNumber, env) {
   // AUTH LIKE YOUR PYTHON SCRIPT
   const userHash = await login(apiKey, username, password);
 
+  // Normalize set number: if it doesn't end with -1, add it for API call
+  // This allows users to input with or without -1
+  let normalizedSetNumber = setNumber.trim();
+  if (!normalizedSetNumber.endsWith('-1')) {
+    normalizedSetNumber = `${normalizedSetNumber}-1`;
+  }
+
   // Get main set info + setID
-  const s = await fetchBricksetSet(apiKey, userHash, setNumber);
+  const s = await fetchBricksetSet(apiKey, userHash, normalizedSetNumber);
 
   const setID = s.setID; // <-- CRITICAL FIX
   let gallery = [];
@@ -93,8 +100,12 @@ export async function fetchSet(setNumber, env) {
     }
   }
 
+  // Return set_num without -1 for display (clean version)
+  const cleanSetNum = s.number; // Just the number part, no variant
+  
   return {
-    set_num: `${s.number}-${s.numberVariant}`,
+    set_num: `${s.number}-${s.numberVariant}`, // Full set number with variant
+    set_num_clean: cleanSetNum, // Clean set number without -1 for titles/SKU
     name: s.name,
     year: s.year ?? "",
     pieces: s.pieces ?? "",
