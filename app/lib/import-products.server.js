@@ -11,10 +11,7 @@ import { processImageToSquare, uploadImageToShopify } from "./image-processor.se
  * @param {Object} env - process.env
  */
 export async function importSets(auth, ids, env) {
-  console.log("DEBUG importSets(): starting with ids:", ids);
-
-  const { admin } = await auth;
-  console.log("DEBUG importSets(): admin exists?", !!admin);
+  const { admin, session } = await auth;
 
   const results = [];
   let importedCount = 0;
@@ -38,7 +35,6 @@ export async function importSets(auth, ids, env) {
       const json = await resp.json();
       const publications = json.data?.publications?.edges || [];
       const channelIds = publications.map(edge => edge.node.id);
-      console.log(`Found ${channelIds.length} sales channels/publications`);
       return channelIds;
     } catch (err) {
       console.warn("Could not fetch sales channels, continuing without them:", err);
@@ -61,11 +57,8 @@ export async function importSets(auth, ids, env) {
     }
 
     try {
-      console.log("DEBUG importSets(): fetching Brickset data for:", setNum);
-
+      console.log(`[${setNum}] Starting import...`);
       const set = await fetchSet(setNum, env);
-
-      console.log("DEBUG fetched Brickset set:", set);
 
       // Use clean set number (without -1) for title
       const cleanSetNum = set.set_num_clean || set.set_num.replace(/-1$/, '');
@@ -195,10 +188,6 @@ export async function importSets(auth, ids, env) {
         metafields,
       };
 
-      console.log(
-        "DEBUG productInput (Brickset):",
-        JSON.stringify(productInput, null, 2),
-      );
 
       // Create the product
       const createMutation = `
@@ -223,10 +212,6 @@ export async function importSets(auth, ids, env) {
       });
       const createJson = await createResp.json();
 
-      console.log(
-        "DEBUG GraphQL productCreate response:",
-        JSON.stringify(createJson, null, 2),
-      );
 
       const productCreate = createJson.data?.productCreate;
       if (!productCreate) {
@@ -257,10 +242,10 @@ export async function importSets(auth, ids, env) {
 
       const productId = productCreate.product.id;
       const productTitle = productCreate.product.title;
+      console.log(`[${setNum}] ✅ Product created: ${productTitle}`);
 
       // Update the default variant with SKU and inventory settings
       // Shopify automatically creates a default variant when a product is created
-      console.log(`\n========== [${setNum}] Starting variant update for product ${productId} ==========`);
       try {
         // First, get the product's variants with inventory item ID
         const productQuery = `
@@ -282,33 +267,25 @@ export async function importSets(auth, ids, env) {
           }
         `;
 
-        console.log(`[${setNum}] Querying product variants...`);
         const productQueryResp = await admin.graphql(productQuery, {
           variables: { id: productId }
         });
         const productQueryJson = await productQueryResp.json();
         
-        // Check for GraphQL errors
         if (productQueryJson.errors) {
-          console.error(`[${setNum}] ❌ GraphQL errors in product query:`, JSON.stringify(productQueryJson.errors, null, 2));
+          console.error(`[${setNum}] ❌ GraphQL errors:`, productQueryJson.errors[0]?.message);
         }
-        
-        console.log(`[${setNum}] Product query response:`, JSON.stringify(productQueryJson, null, 2));
         
         const variant = productQueryJson.data?.product?.variants?.edges?.[0]?.node;
         const variantId = variant?.id;
         const inventoryItemId = variant?.inventoryItem?.id;
         
-        console.log(`[${setNum}] Variant ID: ${variantId}, Inventory Item ID: ${inventoryItemId}`);
-
         if (variantId) {
-          // Step 1: Update the variant with SKU and inventory policy
-          // Use productVariantUpdate for single variant (more reliable than bulk update)
-          console.log(`[${setNum}] Updating variant ${variantId} with SKU: ${cleanSetNum}`);
+          // Update variant with SKU and inventory tracking via productVariantsBulkUpdate
           const variantUpdateMutation = `
-            mutation productVariantUpdate($input: ProductVariantInput!) {
-              productVariantUpdate(input: $input) {
-                productVariant {
+            mutation productVariantsBulkUpdate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+              productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+                productVariants {
                   id
                   sku
                   inventoryPolicy
@@ -323,42 +300,40 @@ export async function importSets(auth, ids, env) {
 
           const variantResp = await admin.graphql(variantUpdateMutation, {
             variables: {
-              input: {
-                id: variantId,
-                sku: cleanSetNum, // Set SKU to clean set number (without -1)
-                inventoryPolicy: "DENY", // Don't allow selling when out of stock
-              }
+              productId: productId,
+              variants: [
+                {
+                  id: variantId,
+                  inventoryPolicy: "DENY", // Don't allow selling when out of stock
+                  inventoryPolicy: "DENY"
+                }
+              ]
             }
           });
 
           const variantJson = await variantResp.json();
-          
-          // Check for GraphQL errors
+          const variantUpdate = variantJson.data?.productVariantsBulkUpdate;
+
           if (variantJson.errors) {
-            console.error(`[${setNum}] ❌ GraphQL errors in variant update:`, JSON.stringify(variantJson.errors, null, 2));
-          }
-          
-          console.log(`[${setNum}] Variant update response:`, JSON.stringify(variantJson, null, 2));
-          const variantUpdate = variantJson.data?.productVariantUpdate;
-
-          if (variantUpdate?.userErrors?.length > 0) {
-            console.warn(`[${setNum}] Variant update userErrors:`, variantUpdate.userErrors);
-          } else if (variantUpdate?.productVariant) {
-            const updatedSku = variantUpdate.productVariant.sku;
-            console.log(`[${setNum}] ✅ Variant updated successfully. SKU set to: ${updatedSku}`);
-          } else {
-            console.warn(`[${setNum}] ⚠️ No productVariant in response`);
+            console.error(`[${setNum}] ❌ Variant update error:`, variantJson.errors[0]?.message);
+          } else if (variantUpdate?.userErrors?.length > 0) {
+            console.error(`[${setNum}] ❌ Variant update failed:`, variantUpdate.userErrors[0]?.message);
           }
 
-          // Step 2: Enable inventory tracking using inventoryItemUpdate
+          // Set SKU and enable inventory tracking via inventoryItemUpdate
           if (inventoryItemId) {
-            console.log(`[${setNum}] Enabling inventory tracking for inventory item ${inventoryItemId}`);
-            const inventoryUpdateMutation = `
-              mutation inventoryItemUpdate($input: InventoryItemUpdateInput!) {
-                inventoryItemUpdate(input: $input) {
-                  inventoryItem {
+            // Use inventoryAdjustQuantity mutation to set SKU and tracked
+            // First, update the variant's SKU directly via productVariantsBulkUpdate with inventoryItem
+            const skuUpdateMutation = `
+              mutation productVariantsBulkUpdate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+                productVariantsBulkUpdate(productId: $productId, variants: $variants) {
+                  productVariants {
                     id
-                    tracked
+                    sku
+                    inventoryItem {
+                      id
+                      tracked
+                    }
                   }
                   userErrors {
                     field
@@ -368,43 +343,77 @@ export async function importSets(auth, ids, env) {
               }
             `;
 
-            const inventoryResp = await admin.graphql(inventoryUpdateMutation, {
+            const skuResp = await admin.graphql(skuUpdateMutation, {
               variables: {
-                input: {
-                  id: inventoryItemId,
-                  tracked: true
-                }
+                productId: productId,
+                variants: [
+                  {
+                    id: variantId,
+                    inventoryItem: {
+                      tracked: true
+                    }
+                  }
+                ]
               }
             });
 
-            const inventoryJson = await inventoryResp.json();
+            const skuJson = await skuResp.json();
+            const skuUpdate = skuJson.data?.productVariantsBulkUpdate;
             
-            // Check for GraphQL errors
-            if (inventoryJson.errors) {
-              console.error(`[${setNum}] ❌ GraphQL errors in inventory update:`, JSON.stringify(inventoryJson.errors, null, 2));
+            if (skuJson.errors) {
+              console.error(`[${setNum}] ❌ SKU update error:`, skuJson.errors[0]?.message);
+            } else if (skuUpdate?.userErrors?.length > 0) {
+              console.error(`[${setNum}] ❌ SKU update failed:`, skuUpdate.userErrors[0]?.message);
+            } else if (skuUpdate?.productVariants?.[0]) {
+              const variant = skuUpdate.productVariants[0];
+              const tracked = variant.inventoryItem?.tracked;
+              
+              // Set SKU using REST API
+              if (session?.shop) {
+                try {
+                  const variantIdNum = variantId.split('/').pop();
+                  const restUrl = `https://${session.shop}/admin/api/2025-10/variants/${variantIdNum}.json`;
+                  const restResp = await fetch(restUrl, {
+                    method: 'PUT',
+                    headers: {
+                      'X-Shopify-Access-Token': session.accessToken,
+                      'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                      variant: {
+                        sku: cleanSetNum
+                      }
+                    })
+                  });
+                  
+                  if (restResp.ok) {
+                    const restJson = await restResp.json();
+                    const sku = restJson.variant?.sku;
+                    if (sku === cleanSetNum && tracked) {
+                      console.log(`[${setNum}] ✅ SKU: ${sku}, Inventory tracking: enabled`);
+                    } else {
+                      if (sku !== cleanSetNum) console.error(`[${setNum}] ❌ SKU not set. Expected: ${cleanSetNum}, Got: ${sku || 'null'}`);
+                      if (!tracked) console.error(`[${setNum}] ❌ Inventory tracking not enabled`);
+                    }
+                  } else {
+                    const errorText = await restResp.text();
+                    console.error(`[${setNum}] ❌ Failed to set SKU: ${restResp.status} ${errorText}`);
+                  }
+                } catch (err) {
+                  console.error(`[${setNum}] ❌ Error setting SKU:`, err.message);
+                }
+              } else {
+                console.error(`[${setNum}] ❌ Cannot set SKU: session.shop not available`);
+              }
             }
-            
-            console.log(`[${setNum}] Inventory update response:`, JSON.stringify(inventoryJson, null, 2));
-            const inventoryUpdate = inventoryJson.data?.inventoryItemUpdate;
-
-            if (inventoryUpdate?.userErrors?.length > 0) {
-              console.warn(`[${setNum}] Inventory tracking enable errors:`, inventoryUpdate.userErrors);
-            } else {
-              const tracked = inventoryUpdate?.inventoryItem?.tracked;
-              console.log(`[${setNum}] ✅ Inventory tracking enabled. Tracked: ${tracked}`);
-            }
-          } else {
-            console.warn(`[${setNum}] ⚠️ No inventory item ID found to enable tracking`);
           }
         } else {
           console.error(`[${setNum}] ❌ ERROR: No variant found to update for product ${productId}`);
         }
       } catch (err) {
-        console.error(`[${setNum}] ❌ ERROR: Failed to update variant:`, err);
-        console.error(`[${setNum}] Error stack:`, err?.stack);
+        console.error(`[${setNum}] ❌ Variant update failed:`, err.message);
         // Continue even if variant update fails
       }
-      console.log(`========== [${setNum}] Finished variant update ==========\n`);
 
       // Publish to all available sales channels (but keep as draft)
       // Note: publishablePublish selects channels but product remains draft until manually activated
@@ -432,7 +441,6 @@ export async function importSets(auth, ids, env) {
             publicationId: channelId
           }));
 
-          console.log(`Attempting to publish product to ${availableChannels.length} sales channels...`);
 
           const publishResp = await admin.graphql(publishMutation, {
             variables: {
@@ -445,26 +453,24 @@ export async function importSets(auth, ids, env) {
           
           // Check for GraphQL errors
           if (publishJson.errors) {
-            console.error(`[${setNum}] ❌ GraphQL errors in sales channel publish:`, JSON.stringify(publishJson.errors, null, 2));
+            console.error(`[${setNum}] ❌ Sales channel publish error:`, publishJson.errors[0]?.message);
           }
           
           if (publishJson.data?.publishablePublish?.userErrors?.length > 0) {
-            console.warn(`[${setNum}] Sales channel publishing userErrors:`, JSON.stringify(publishJson.data.publishablePublish.userErrors, null, 2));
+            console.error(`[${setNum}] ❌ Sales channel publish failed:`, publishJson.data.publishablePublish.userErrors[0]?.message);
           } else if (publishJson.data?.publishablePublish) {
             const publishedProduct = publishJson.data?.publishablePublish?.publishable;
             const status = publishedProduct?.status || "unknown";
             const publishedAt = publishedProduct?.publishedAt;
-            console.log(`[${setNum}] ✅ Product published to ${availableChannels.length} sales channels. Status: ${status}, PublishedAt: ${publishedAt || "null (draft)"}`);
+            console.log(`[${setNum}] ✅ Published to ${availableChannels.length} sales channels`);
           } else {
             console.warn(`[${setNum}] ⚠️ No data returned from publishablePublish`);
           }
         } catch (err) {
-          console.warn("Failed to publish to sales channels:", err);
-          console.warn("Error details:", err.message, err.stack);
+          console.error(`[${setNum}] ❌ Failed to publish to sales channels:`, err.message);
           // Continue even if publishing fails
         }
       } else {
-        console.warn("No sales channels found to publish to");
       }
 
       // Attach all images from Brickset using productCreateMedia
@@ -513,10 +519,6 @@ export async function importSets(auth, ids, env) {
         });
         const mediaJson = await mediaResp.json();
 
-        console.log(
-          "DEBUG GraphQL productCreateMedia response:",
-          JSON.stringify(mediaJson, null, 2),
-        );
 
         const mediaErrors =
           mediaJson.data?.productCreateMedia?.mediaUserErrors || [];
@@ -544,10 +546,7 @@ export async function importSets(auth, ids, env) {
     });
 
     } catch (err) {
-      console.error(
-        `Error importing set ${setNum}:`,
-        err?.stack || err?.message || err,
-      );
+      console.error(`[${setNum}] ❌ Import failed:`, err?.message || 'Unknown error');
 
       results.push({
         id: setNum,

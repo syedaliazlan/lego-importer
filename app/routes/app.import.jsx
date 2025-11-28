@@ -30,10 +30,7 @@ export async function action({ request }) {
       );
     }
 
-    // FIX: pass the *resolved* auth, not the promise
     const result = await importSets(auth, ids, process.env);
-
-    console.log("DEBUG action: importSets result", result);
 
     return new Response(JSON.stringify(result), {
       status: 200,

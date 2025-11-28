@@ -96,7 +96,6 @@ export async function fetchSet(setNumber, env) {
       const extraImages = await getAdditionalImages(apiKey, userHash, setID);
       gallery = [...new Set([...gallery, ...extraImages])];
     } catch {
-      console.log(`⚠ Additional images failed for ${setNumber}`);
     }
   }
 
