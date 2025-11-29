@@ -16,6 +16,56 @@ export async function importSets(auth, ids, env) {
   const results = [];
   let importedCount = 0;
 
+  // Helper function to check if a product with the given SKU already exists
+  async function checkProductExists(admin, sku) {
+    try {
+      const checkQuery = `
+        query checkProductBySku($query: String!) {
+          products(first: 1, query: $query) {
+            edges {
+              node {
+                id
+                title
+                status
+                variants(first: 1) {
+                  edges {
+                    node {
+                      sku
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      `;
+      
+      // Search for products with this SKU
+      const query = `sku:${sku}`;
+      const resp = await admin.graphql(checkQuery, {
+        variables: { query }
+      });
+      const json = await resp.json();
+      
+      const products = json.data?.products?.edges || [];
+      if (products.length > 0) {
+        const product = products[0].node;
+        return {
+          exists: true,
+          productId: product.id,
+          title: product.title,
+          status: product.status
+        };
+      }
+      
+      return { exists: false };
+    } catch (err) {
+      // If query fails, log but don't block import (fail open)
+      console.warn(`Could not check for existing product with SKU ${sku}:`, err.message);
+      return { exists: false, error: err.message };
+    }
+  }
+
   // Helper function to get all available sales channels/publications
   async function getAvailableChannels(admin) {
     try {
@@ -54,6 +104,7 @@ export async function importSets(auth, ids, env) {
       results.push({
         id: rawId,
         status: "error",
+        errorCode: "INVALID_SET_NUMBER",
         message: "Empty or invalid set number",
       });
       continue;
@@ -61,10 +112,40 @@ export async function importSets(auth, ids, env) {
 
     try {
       console.log(`[${setNum}] Starting import...`);
-      const set = await fetchSet(setNum, env);
+      
+      // First, fetch set data to get the clean SKU
+      let set;
+      try {
+        set = await fetchSet(setNum, env);
+      } catch (err) {
+        console.error(`[${setNum}] ❌ Failed to fetch from Brickset:`, err.message);
+        results.push({
+          id: setNum,
+          status: "error",
+          errorCode: "BRICKSET_FETCH_ERROR",
+          message: `Failed to fetch set data from Brickset: ${err.message}`,
+        });
+        continue;
+      }
 
-      // Use clean set number (without -1) for title
+      // Use clean set number (without -1) for title and SKU
       const cleanSetNum = set.set_num_clean || set.set_num.replace(/-1$/, '');
+      
+      // Check if product with this SKU already exists
+      const existingProduct = await checkProductExists(admin, cleanSetNum);
+      if (existingProduct.exists) {
+        console.log(`[${setNum}] ⚠️ Product already exists with SKU ${cleanSetNum}: ${existingProduct.title} (${existingProduct.status})`);
+        results.push({
+          id: setNum,
+          status: "skipped",
+          errorCode: "DUPLICATE_SKU",
+          message: `Product already exists with SKU "${cleanSetNum}": "${existingProduct.title}" (Status: ${existingProduct.status})`,
+          existingProductId: existingProduct.productId,
+          existingProductTitle: existingProduct.title,
+          existingProductStatus: existingProduct.status,
+        });
+        continue;
+      }
       
       const title = [
       `${set.name} ${cleanSetNum}`,
@@ -217,9 +298,28 @@ export async function importSets(auth, ids, env) {
       const createJson = await createResp.json();
 
 
+      // Check for GraphQL errors
+      if (createJson.errors) {
+        const errorMsg = createJson.errors[0]?.message || "Unknown GraphQL error";
+        console.error(`[${setNum}] ❌ Product creation GraphQL error:`, errorMsg);
+        results.push({
+          id: setNum,
+          status: "error",
+          errorCode: "PRODUCT_CREATE_ERROR",
+          message: `Failed to create product: ${errorMsg}`,
+        });
+        continue;
+      }
+
       const productCreate = createJson.data?.productCreate;
       if (!productCreate) {
-        throw new Error("No productCreate payload returned from Shopify");
+        results.push({
+          id: setNum,
+          status: "error",
+          errorCode: "PRODUCT_CREATE_ERROR",
+          message: "No productCreate payload returned from Shopify",
+        });
+        continue;
       }
 
       if (productCreate.userErrors && productCreate.userErrors.length > 0) {
@@ -239,7 +339,12 @@ export async function importSets(auth, ids, env) {
           const msg = criticalErrors
             .map((e) => e.message)
             .join("; ");
-          results.push({ id: setNum, status: "error", message: msg });
+          results.push({
+            id: setNum,
+            status: "error",
+            errorCode: "PRODUCT_CREATE_ERROR",
+            message: `Failed to create product: ${msg}`,
+          });
           continue;
         }
       }
@@ -277,12 +382,32 @@ export async function importSets(auth, ids, env) {
         const productQueryJson = await productQueryResp.json();
         
         if (productQueryJson.errors) {
-          console.error(`[${setNum}] ❌ GraphQL errors:`, productQueryJson.errors[0]?.message);
+          const errorMsg = productQueryJson.errors[0]?.message || "Unknown error";
+          console.error(`[${setNum}] ❌ GraphQL errors fetching variant:`, errorMsg);
+          results.push({
+            id: setNum,
+            status: "error",
+            errorCode: "VARIANT_QUERY_ERROR",
+            message: `Failed to fetch product variant: ${errorMsg}`,
+            shopifyProductId: productId,
+          });
+          continue;
         }
         
         const variant = productQueryJson.data?.product?.variants?.edges?.[0]?.node;
         const variantId = variant?.id;
         const inventoryItemId = variant?.inventoryItem?.id;
+        
+        if (!variantId) {
+          results.push({
+            id: setNum,
+            status: "error",
+            errorCode: "VARIANT_NOT_FOUND",
+            message: "No variant found for the created product",
+            shopifyProductId: productId,
+          });
+          continue;
+        }
         
         if (variantId) {
           // Update variant with SKU and inventory tracking via productVariantsBulkUpdate
@@ -319,9 +444,13 @@ export async function importSets(auth, ids, env) {
           const variantUpdate = variantJson.data?.productVariantsBulkUpdate;
 
           if (variantJson.errors) {
-            console.error(`[${setNum}] ❌ Variant update error:`, variantJson.errors[0]?.message);
+            const errorMsg = variantJson.errors[0]?.message || "Unknown error";
+            console.error(`[${setNum}] ❌ Variant update error:`, errorMsg);
+            // Don't fail the import for variant update errors, but log them
           } else if (variantUpdate?.userErrors?.length > 0) {
-            console.error(`[${setNum}] ❌ Variant update failed:`, variantUpdate.userErrors[0]?.message);
+            const errorMsg = variantUpdate.userErrors[0]?.message || "Unknown error";
+            console.error(`[${setNum}] ❌ Variant update failed:`, errorMsg);
+            // Don't fail the import for variant update errors, but log them
           }
 
           // Set SKU and enable inventory tracking via inventoryItemUpdate
@@ -365,9 +494,13 @@ export async function importSets(auth, ids, env) {
             const skuUpdate = skuJson.data?.productVariantsBulkUpdate;
             
             if (skuJson.errors) {
-              console.error(`[${setNum}] ❌ SKU update error:`, skuJson.errors[0]?.message);
+              const errorMsg = skuJson.errors[0]?.message || "Unknown error";
+              console.error(`[${setNum}] ❌ Inventory tracking update error:`, errorMsg);
+              // Don't fail the import, but note the error
             } else if (skuUpdate?.userErrors?.length > 0) {
-              console.error(`[${setNum}] ❌ SKU update failed:`, skuUpdate.userErrors[0]?.message);
+              const errorMsg = skuUpdate.userErrors[0]?.message || "Unknown error";
+              console.error(`[${setNum}] ❌ Inventory tracking update failed:`, errorMsg);
+              // Don't fail the import, but note the error
             } else if (skuUpdate?.productVariants?.[0]) {
               const variant = skuUpdate.productVariants[0];
               const tracked = variant.inventoryItem?.tracked;
@@ -396,27 +529,35 @@ export async function importSets(auth, ids, env) {
                     if (sku === cleanSetNum && tracked) {
                       console.log(`[${setNum}] ✅ SKU: ${sku}, Inventory tracking: enabled`);
                     } else {
-                      if (sku !== cleanSetNum) console.error(`[${setNum}] ❌ SKU not set. Expected: ${cleanSetNum}, Got: ${sku || 'null'}`);
-                      if (!tracked) console.error(`[${setNum}] ❌ Inventory tracking not enabled`);
+                      if (sku !== cleanSetNum) {
+                        console.error(`[${setNum}] ❌ SKU not set. Expected: ${cleanSetNum}, Got: ${sku || 'null'}`);
+                        // Note: This is a warning, not a fatal error
+                      }
+                      if (!tracked) {
+                        console.error(`[${setNum}] ❌ Inventory tracking not enabled`);
+                        // Note: This is a warning, not a fatal error
+                      }
                     }
                   } else {
                     const errorText = await restResp.text();
                     console.error(`[${setNum}] ❌ Failed to set SKU: ${restResp.status} ${errorText}`);
+                    // Note: This is a warning, not a fatal error - product was created successfully
                   }
                 } catch (err) {
                   console.error(`[${setNum}] ❌ Error setting SKU:`, err.message);
+                  // Note: This is a warning, not a fatal error - product was created successfully
                 }
               } else {
                 console.error(`[${setNum}] ❌ Cannot set SKU: session.shop not available`);
+                // Note: This is a warning, not a fatal error - product was created successfully
               }
             }
           }
-        } else {
-          console.error(`[${setNum}] ❌ ERROR: No variant found to update for product ${productId}`);
         }
       } catch (err) {
         console.error(`[${setNum}] ❌ Variant update failed:`, err.message);
-        // Continue even if variant update fails
+        // Continue even if variant update fails - product was created successfully
+        // This is a non-fatal error
       }
 
       // Publish to all available sales channels (but keep as draft)
@@ -457,11 +598,15 @@ export async function importSets(auth, ids, env) {
           
           // Check for GraphQL errors
           if (publishJson.errors) {
-            console.error(`[${setNum}] ❌ Sales channel publish error:`, publishJson.errors[0]?.message);
+            const errorMsg = publishJson.errors[0]?.message || "Unknown error";
+            console.error(`[${setNum}] ❌ Sales channel publish error:`, errorMsg);
+            // Note: This is a warning, not a fatal error - product was created successfully
           }
           
           if (publishJson.data?.publishablePublish?.userErrors?.length > 0) {
-            console.error(`[${setNum}] ❌ Sales channel publish failed:`, publishJson.data.publishablePublish.userErrors[0]?.message);
+            const errorMsg = publishJson.data.publishablePublish.userErrors[0]?.message || "Unknown error";
+            console.error(`[${setNum}] ❌ Sales channel publish failed:`, errorMsg);
+            // Note: This is a warning, not a fatal error - product was created successfully
           } else if (publishJson.data?.publishablePublish) {
             const publishedProduct = publishJson.data?.publishablePublish?.publishable;
             const status = publishedProduct?.status || "unknown";
@@ -472,7 +617,8 @@ export async function importSets(auth, ids, env) {
           }
         } catch (err) {
           console.error(`[${setNum}] ❌ Failed to publish to sales channels:`, err.message);
-          // Continue even if publishing fails
+          // Continue even if publishing fails - product was created successfully
+          // This is a non-fatal error
         }
       } else {
       }
@@ -524,13 +670,19 @@ export async function importSets(auth, ids, env) {
         const mediaJson = await mediaResp.json();
 
 
+        // Check for GraphQL errors
+        if (mediaJson.errors) {
+          const errorMsg = mediaJson.errors[0]?.message || "Unknown error";
+          console.error(`[${setNum}] ❌ Image attachment GraphQL error:`, errorMsg);
+          // Note: This is a warning, not a fatal error - product was created successfully
+        }
+
         const mediaErrors =
           mediaJson.data?.productCreateMedia?.mediaUserErrors || [];
         if (mediaErrors.length) {
-          console.warn(
-            "MediaUserErrors while attaching Brickset images:",
-            mediaErrors,
-          );
+          const errorMsg = mediaErrors.map(e => e.message).join("; ");
+          console.warn(`[${setNum}] ⚠️ Image attachment errors:`, errorMsg);
+          // Note: This is a warning, not a fatal error - product was created successfully
         }
 
         attachedCount =
@@ -541,21 +693,43 @@ export async function importSets(auth, ids, env) {
 
       // IMPORTANT: return the fields your table expects
       results.push({
-      id: setNum,
-      status: "created",
-      message: `${productTitle} (${setNum}) – ${attachedCount} images`,
-      shopifyProductTitle: productTitle,
-      shopifyProductId: productId,
-      imageCount: attachedCount
-    });
+        id: setNum,
+        status: "created",
+        errorCode: null, // No error
+        message: `${productTitle} (${setNum}) – ${attachedCount} images`,
+        shopifyProductTitle: productTitle,
+        shopifyProductId: productId,
+        imageCount: attachedCount
+      });
 
     } catch (err) {
       console.error(`[${setNum}] ❌ Import failed:`, err?.message || 'Unknown error');
 
+      // Determine error code based on error message
+      let errorCode = "UNKNOWN_ERROR";
+      const errorMessage = err?.message || "Unknown error";
+      
+      if (errorMessage.includes("Brickset") || errorMessage.includes("brickset")) {
+        errorCode = "BRICKSET_FETCH_ERROR";
+      } else if (errorMessage.includes("product") && errorMessage.includes("create")) {
+        errorCode = "PRODUCT_CREATE_ERROR";
+      } else if (errorMessage.includes("variant")) {
+        errorCode = "VARIANT_UPDATE_ERROR";
+      } else if (errorMessage.includes("SKU") || errorMessage.includes("sku")) {
+        errorCode = "SKU_SET_ERROR";
+      } else if (errorMessage.includes("inventory")) {
+        errorCode = "INVENTORY_ERROR";
+      } else if (errorMessage.includes("sales channel") || errorMessage.includes("publish")) {
+        errorCode = "SALES_CHANNEL_ERROR";
+      } else if (errorMessage.includes("image") || errorMessage.includes("media")) {
+        errorCode = "IMAGE_ERROR";
+      }
+
       results.push({
         id: setNum,
         status: "error",
-        message: err?.message || "Unknown error",
+        errorCode,
+        message: errorMessage,
       });
     }
   }
