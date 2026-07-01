@@ -310,8 +310,8 @@ export default function BackfillBarcodes() {
 
             {lastError && (
               <p style={{ color: "#b83c3c", marginBottom: 12 }}>
-                Stopped: {lastError} Click the blue Resume button to carry on without redoing what is already
-                done.
+                Stopped: {lastError} Click Resume to carry on from where it stopped, without redoing what is
+                already done.
               </p>
             )}
 
@@ -334,7 +334,8 @@ export default function BackfillBarcodes() {
               <div>
                 <p style={{ color: "#444", marginBottom: 8 }}>
                   {totals.missingEan.length} set(s) have no EAN in Brickset and {totals.notFound.length} SKU(s)
-                  were not found. These are the ones to flag to Joe.
+                  were not found on Brickset. Download the list to review the sets that could not be matched to
+                  a barcode automatically.
                 </p>
                 <button
                   type="button"
