@@ -76,11 +76,16 @@ export default function BackfillBarcodes() {
   const [running, setRunning] = useState(false);
   const [mode, setMode] = useState("preview");
 
+  const [canResume, setCanResume] = useState(false);
+
   const stopRef = useRef(false);
   const modeRef = useRef("preview");
   const handledRef = useRef(null); // dedupe: last fetcher.data object we processed
+  const attemptCursorRef = useRef(""); // cursor of the chunk currently in flight
+  const resumeCursorRef = useRef(null); // where to carry on from after a stop or error
 
   function submitChunk(cursor) {
+    attemptCursorRef.current = cursor || "";
     const fd = new FormData();
     fd.set("mode", modeRef.current);
     fd.set("cursor", cursor || "");
@@ -91,10 +96,20 @@ export default function BackfillBarcodes() {
     stopRef.current = false;
     modeRef.current = selectedMode;
     handledRef.current = null;
+    resumeCursorRef.current = null;
+    setCanResume(false);
     setMode(selectedMode);
     setTotals(emptyTotals());
     setRunning(true);
     submitChunk("");
+  }
+
+  function resume() {
+    stopRef.current = false;
+    handledRef.current = null;
+    setCanResume(false);
+    setRunning(true);
+    submitChunk(resumeCursorRef.current || "");
   }
 
   function stop() {
@@ -108,19 +123,33 @@ export default function BackfillBarcodes() {
     if (handledRef.current === data) return; // process each response once
     handledRef.current = data;
 
-    setTotals((t) => mergeTotals(t, data));
-
     if (data.error) {
+      // The in-flight chunk failed; let the user resume from the same point.
+      resumeCursorRef.current = attemptCursorRef.current;
+      setCanResume(true);
       setRunning(false);
       return;
     }
-    if (stopRef.current || data.done || !data.nextCursor) {
+
+    setTotals((t) => mergeTotals(t, data));
+
+    if (data.done || !data.nextCursor) {
+      resumeCursorRef.current = null;
+      setCanResume(false);
+      setRunning(false);
+      return;
+    }
+    if (stopRef.current) {
+      resumeCursorRef.current = data.nextCursor;
+      setCanResume(true);
       setRunning(false);
       return;
     }
     // Small gap between chunks to stay gentle on the Brickset API.
     const timer = setTimeout(() => {
       if (stopRef.current) {
+        resumeCursorRef.current = data.nextCursor;
+        setCanResume(true);
         setRunning(false);
         return;
       }
@@ -227,6 +256,24 @@ export default function BackfillBarcodes() {
               Run backfill
             </button>
 
+            {!running && canResume && (
+              <button
+                type="button"
+                onClick={resume}
+                style={{
+                  padding: "10px 20px",
+                  backgroundColor: "#005bd3",
+                  color: "white",
+                  border: "none",
+                  borderRadius: 6,
+                  fontWeight: 600,
+                  cursor: "pointer",
+                }}
+              >
+                Resume from where it stopped
+              </button>
+            )}
+
             {running && (
               <button
                 type="button"
@@ -263,7 +310,8 @@ export default function BackfillBarcodes() {
 
             {lastError && (
               <p style={{ color: "#b83c3c", marginBottom: 12 }}>
-                Stopped on an error: {lastError}. You can run again to resume.
+                Stopped: {lastError} Click the blue Resume button to carry on without redoing what is already
+                done.
               </p>
             )}
 
