@@ -22,7 +22,7 @@ export async function action({ request }) {
     const mode = formData.get("mode") === "commit" ? "commit" : "preview";
     const cursor = formData.get("cursor") || null;
 
-    const result = await backfillChunk(admin, process.env, { cursor, mode, pageSize: 50 });
+    const result = await backfillChunk(admin, process.env, { cursor, mode, pageSize: 100 });
 
     return new Response(JSON.stringify(result), {
       status: 200,
@@ -118,7 +118,15 @@ export default function BackfillBarcodes() {
       setRunning(false);
       return;
     }
-    submitChunk(data.nextCursor);
+    // Small gap between chunks to stay gentle on the Brickset API.
+    const timer = setTimeout(() => {
+      if (stopRef.current) {
+        setRunning(false);
+        return;
+      }
+      submitChunk(data.nextCursor);
+    }, 400);
+    return () => clearTimeout(timer);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fetcher.data, fetcher.state]);
 
@@ -127,26 +135,40 @@ export default function BackfillBarcodes() {
   const hasRun = totals.chunks > 0;
   const lastError = fetcher.data?.error;
 
-  const missingText = useMemo(() => {
-    const lines = [];
-    if (totals.missingEan.length) {
-      lines.push("# Sets with no EAN in Brickset");
-      lines.push(...totals.missingEan);
-      lines.push("");
+  const flagged = useMemo(() => {
+    const rows = [];
+    for (const r of totals.missingEan) {
+      rows.push({ setNumber: r.setNumber, productName: r.productName, reason: "No EAN in Brickset" });
     }
-    if (totals.notFound.length) {
-      lines.push("# SKUs not found on Brickset");
-      lines.push(...totals.notFound);
+    for (const r of totals.notFound) {
+      rows.push({ setNumber: r.setNumber, productName: r.productName, reason: "Not found on Brickset" });
     }
-    return lines.join("\n");
+    return rows;
   }, [totals.missingEan, totals.notFound]);
 
-  function downloadMissing() {
-    const blob = new Blob([missingText], { type: "text/plain" });
+  const flaggedDisplay = useMemo(() => {
+    if (!flagged.length) return "None";
+    const lines = flagged.map(
+      (r) => `${String(r.setNumber).padEnd(12)} ${r.productName} (${r.reason})`
+    );
+    return ["Set number   Product name (reason)", ...lines].join("\n");
+  }, [flagged]);
+
+  function csvEscape(value) {
+    const s = String(value ?? "");
+    return /[",\n\r]/.test(s) ? `"${s.replace(/"/g, '""')}"` : s;
+  }
+
+  function downloadFlaggedCsv() {
+    const header = ["Set Number", "Product Name", "Reason"];
+    const rows = flagged.map((r) => [r.setNumber, r.productName, r.reason].map(csvEscape).join(","));
+    const csv = [header.join(","), ...rows].join("\r\n");
+    // Prepend a UTF-8 BOM so Excel opens accented product names correctly.
+    const blob = new Blob(["﻿" + csv], { type: "text/csv;charset=utf-8" });
     const url = URL.createObjectURL(blob);
     const a = document.createElement("a");
     a.href = url;
-    a.download = "barcode-backfill-flagged-sets.txt";
+    a.download = "barcode-backfill-flagged-sets.csv";
     document.body.appendChild(a);
     a.click();
     a.remove();
@@ -162,7 +184,7 @@ export default function BackfillBarcodes() {
           <h1 style={{ fontSize: 22, fontWeight: 600, marginBottom: 10 }}>Backfill EAN barcodes</h1>
           <p style={{ marginBottom: 8, color: "#444" }}>
             Goes through your existing products, matches each one to its Brickset set by SKU, and fills in the
-            EAN barcode so it scans at Shopify POS. Only empty barcodes are filled — products that already have
+            EAN barcode so it scans at Shopify POS. Only empty barcodes are filled. Products that already have
             a barcode are left untouched, so it is safe to run more than once.
           </p>
           <p style={{ marginBottom: 20, color: "#444" }}>
@@ -256,7 +278,7 @@ export default function BackfillBarcodes() {
 
             {totals.errors.length > 0 && (
               <p style={{ color: "#b83c3c", marginBottom: 12 }}>
-                {totals.errors.length} write error(s). First: {totals.errors[0].sku} — {totals.errors[0].message}
+                {totals.errors.length} write error(s). First: {totals.errors[0].sku}: {totals.errors[0].message}
               </p>
             )}
 
@@ -268,7 +290,7 @@ export default function BackfillBarcodes() {
                 </p>
                 <button
                   type="button"
-                  onClick={downloadMissing}
+                  onClick={downloadFlaggedCsv}
                   style={{
                     padding: "8px 16px",
                     backgroundColor: "#f4f4f4",
@@ -280,7 +302,7 @@ export default function BackfillBarcodes() {
                     marginBottom: 12,
                   }}
                 >
-                  Download flagged list (.txt)
+                  Download flagged list (.csv)
                 </button>
                 <pre
                   style={{
@@ -294,7 +316,7 @@ export default function BackfillBarcodes() {
                     whiteSpace: "pre-wrap",
                   }}
                 >
-                  {missingText || "None"}
+                  {flaggedDisplay}
                 </pre>
               </div>
             )}

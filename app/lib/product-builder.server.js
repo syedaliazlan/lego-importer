@@ -3,7 +3,7 @@
 export function buildSetProduct(setData, defaults) {
   return {
     product: {
-      title: `LEGO ${setData.set_num} – ${setData.name}`,
+      title: `LEGO ${setData.set_num}: ${setData.name}`,
       vendor: defaults.vendor,
       product_type: defaults.typeSet,
       status: defaults.status,
@@ -15,7 +15,7 @@ export function buildSetProduct(setData, defaults) {
 export function buildPartProduct(partData, defaults) {
   return {
     product: {
-      title: `LEGO Part ${partData.part_num} – ${partData.name}`,
+      title: `LEGO Part ${partData.part_num}: ${partData.name}`,
       vendor: defaults.vendor,
       product_type: defaults.typePart,
       status: defaults.status,

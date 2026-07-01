@@ -638,7 +638,7 @@ export async function importSets(auth, ids, env) {
           alt:
             index === 0
               ? title
-              : `${title} – image ${index + 1}`,
+              : `${title} (image ${index + 1})`,
           mediaContentType: "IMAGE",
           originalSource: url,
         }));
@@ -701,7 +701,7 @@ export async function importSets(auth, ids, env) {
         id: setNum,
         status: "created",
         errorCode: null, // No error
-        message: `${productTitle} (${setNum}) – ${attachedCount} images – ${barcodeNote}`,
+        message: `${productTitle} (${setNum}): ${attachedCount} images, ${barcodeNote}`,
         shopifyProductTitle: productTitle,
         shopifyProductId: productId,
         imageCount: attachedCount,

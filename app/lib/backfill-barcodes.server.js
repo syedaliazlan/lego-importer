@@ -14,7 +14,7 @@
 import { fetchEansForSetNumbers } from "./brickset.server.js";
 
 /* ===============================================================
-   PURE HELPERS (no I/O — unit tested)
+   PURE HELPERS (no I/O, unit tested)
 =============================================================== */
 
 /**
@@ -190,10 +190,16 @@ export async function backfillChunk(admin, env, opts = {}) {
         report.skipped++;
         break;
       case "notFound":
-        report.notFound.push(sku || it.node.id);
+        report.notFound.push({
+          setNumber: it.parsed?.clean || sku,
+          productName: it.node.product?.title || "",
+        });
         break;
       case "missingEan":
-        report.missingEan.push(sku || it.parsed.clean);
+        report.missingEan.push({
+          setNumber: it.parsed?.clean || sku,
+          productName: it.node.product?.title || "",
+        });
         break;
       case "fill": {
         const pid = it.node.product?.id;
