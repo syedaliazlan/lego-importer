@@ -434,7 +434,9 @@ export async function importSets(auth, ids, env) {
                 {
                   id: variantId,
                   inventoryPolicy: "DENY", // Don't allow selling when out of stock
-                  inventoryPolicy: "DENY"
+                  // EAN from Brickset -> variant barcode so the set scans at Shopify POS.
+                  // Left null when Brickset has no EAN (flagged in the result message below).
+                  barcode: set.ean || null,
                 }
               ]
             }
@@ -691,15 +693,19 @@ export async function importSets(auth, ids, env) {
 
       importedCount += 1;
 
+      // Note whether Brickset supplied an EAN so missing barcodes surface in the UI.
+      const barcodeNote = set.ean ? `barcode ${set.ean}` : "no EAN in Brickset";
+
       // IMPORTANT: return the fields your table expects
       results.push({
         id: setNum,
         status: "created",
         errorCode: null, // No error
-        message: `${productTitle} (${setNum}) – ${attachedCount} images`,
+        message: `${productTitle} (${setNum}) – ${attachedCount} images – ${barcodeNote}`,
         shopifyProductTitle: productTitle,
         shopifyProductId: productId,
-        imageCount: attachedCount
+        imageCount: attachedCount,
+        ean: set.ean || null,
       });
 
     } catch (err) {

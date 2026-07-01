@@ -112,6 +112,56 @@ export async function fetchSet(setNumber, env) {
     subtheme: s.subtheme ?? "",
     description: s.extendedData?.description ?? s.notes ?? "",
     bricksetURL: s.bricksetURL || "",
+    ean: (s.barcode?.EAN || "").trim(),  // EAN-13 for Shopify POS barcode scanning
+    upc: (s.barcode?.UPC || "").trim(),  // US UPC; captured but not written to Shopify (won't match UK/EU boxes)
     gallery  // FULL IMAGE SET NOW WORKING
   };
+}
+
+/* ===============================================================
+   BATCH EAN LOOKUP — used by the barcode backfill
+   getSets accepts a comma-delimited setNumber list; pageSize max 500.
+   Returns the raw Brickset set objects (each has .number and .barcode.EAN).
+=============================================================== */
+export async function fetchEansForSetNumbers(setNumbers, env) {
+  const apiKey = env.BRICKSET_API_KEY;
+  const username = env.BRICKSET_USERNAME;
+  const password = env.BRICKSET_PASSWORD;
+
+  if (!apiKey || !username || !password) {
+    throw new Error("Missing BRICKSET_API_KEY / USERNAME / PASSWORD in .env");
+  }
+
+  // De-duplicate; a single Shopify page can repeat set numbers across variants.
+  const unique = [...new Set((setNumbers || []).filter(Boolean))];
+  if (unique.length === 0) return [];
+
+  // One login per call; reuse the userHash across all batches.
+  const userHash = await login(apiKey, username, password);
+
+  const sets = [];
+  for (let i = 0; i < unique.length; i += 500) {
+    const batch = unique.slice(i, i + 500);
+
+    const res = await fetch(`${API_URL}/getSets`, {
+      method: "POST",
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        apiKey,
+        userHash,
+        params: JSON.stringify({
+          setNumber: batch.join(","),
+          pageSize: 500,
+        }),
+      }),
+    });
+
+    const data = await res.json();
+    if (data.status && data.status !== "success") {
+      throw new Error(`Brickset getSets failed: ${JSON.stringify(data)}`);
+    }
+    if (Array.isArray(data.sets)) sets.push(...data.sets);
+  }
+
+  return sets;
 }
