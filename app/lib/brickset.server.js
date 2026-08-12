@@ -131,15 +131,19 @@ async function getUserHash(apiKey, username, password, forceRefresh = false) {
   return cachedHash;
 }
 
-// Turn a getSets JSON error into a clear, correctly-typed Error.
-function throwGetSetsError(message) {
+// Turn a Brickset JSON error into a clear, correctly-typed Error.
+function throwBricksetDataError(operation, message) {
   if (/api limit exceeded/i.test(message)) {
     throw new Error(
-      "Brickset daily API limit reached (getSets). This quota resets each day. " +
+      `Brickset daily API limit reached (${operation}). This quota resets each day. ` +
         "Try again tomorrow, or reduce how much you sync at once."
     );
   }
-  throw new Error(`Brickset getSets failed: ${message}`);
+  throw new Error(`Brickset ${operation} failed: ${message}`);
+}
+
+function throwGetSetsError(message) {
+  throwBricksetDataError("getSets", message);
 }
 
 /* ---------------- getSets (single set) ---------------- */
@@ -243,4 +247,192 @@ export async function fetchEansForSetNumbers(setNumbers, env) {
     sets.push(...batchSets);
   }
   return sets;
+}
+
+/* ===============================================================
+   MINIFIGURES
+
+   Despite its name, getMinifigCollection returns catalogue data for ANY
+   minifigure when given a `query`, not just ones this account owns. The
+   ownedTotal fields simply come back as 0.
+
+   Two quirks drive the lookup strategy below:
+     1. `query` will not take a comma-delimited list. "sw0197,sw0308"
+        matches nothing, so there is no true batch call.
+     2. `query` prefix matches. "sw019" returns sw0190 through sw0199 in
+        one call, so dropping the last character of each ID lets one
+        request resolve up to ten neighbours.
+
+   Minifigure IDs follow BrickLink's catalogue scheme (sw0197, hp001,
+   col001, njo0500), which is what the storefront already uses.
+=============================================================== */
+
+// A prefix query can return the whole numeric neighbourhood of an ID.
+// 100 leaves plenty of headroom over the ~10 we expect.
+const MINIFIG_PAGE_SIZE = 100;
+
+// Brickset minifigure categories use theme names that differ from the set
+// themes already used as the product vendor. Align them so a City set and
+// a City minifigure sit under the same vendor.
+const THEME_ALIASES = new Map([
+  ["town", "City"],
+  ["ninjago", "Ninjago"],
+]);
+
+/**
+ * Normalise a minifigure ID to Brickset's lowercase catalogue form.
+ * "SW0197" and " sw0197 " both become "sw0197".
+ * Returns "" for anything that is not a plausible minifigure ID, which is
+ * how a pasted set number ("40760") gets rejected before it hits the API.
+ * @param {unknown} rawId
+ * @returns {string}
+ */
+export function normalizeMinifigId(rawId) {
+  const id = String(rawId ?? "")
+    .trim()
+    .toLowerCase();
+  return /^[a-z]{2,6}\d{1,5}[a-z]?$/.test(id) ? id : "";
+}
+
+/**
+ * Group IDs so that one prefix query resolves several of them.
+ * Dropping the last character of "sw0197" gives "sw019", which prefix
+ * matches sw0190 to sw0199. Short IDs are queried whole.
+ * @param {Array<string>} ids - already normalised
+ * @returns {Map<string, Array<string>>} prefix -> IDs that share it
+ */
+export function groupIdsByPrefix(ids) {
+  const groups = new Map();
+  for (const id of ids || []) {
+    const prefix = id.length > 3 ? id.slice(0, -1) : id;
+    if (!groups.has(prefix)) groups.set(prefix, []);
+    groups.get(prefix).push(id);
+  }
+  return groups;
+}
+
+/**
+ * Split a Brickset minifigure category path into theme and subtheme.
+ * The path varies in depth:
+ *   "Star Wars / Star Wars The Clone Wars" -> Star Wars, Star Wars The Clone Wars
+ *   "Town / City / Building"               -> City (aliased), Building
+ *   "Collectible Minifigures"              -> Collectible Minifigures, ""
+ * The first segment is the theme and the last is the most specific
+ * subtheme. Internal whitespace is collapsed, which tidies Brickset's
+ * double space in "Series  1 Minifigures".
+ * @param {unknown} rawCategory
+ * @returns {{theme: string, subtheme: string}}
+ */
+export function parseMinifigCategory(rawCategory) {
+  const segments = String(rawCategory ?? "")
+    .split("/")
+    .map((part) => part.replace(/\s+/g, " ").trim())
+    .filter(Boolean);
+
+  if (segments.length === 0) return { theme: "", subtheme: "" };
+
+  return {
+    theme: normalizeTheme(segments[0]),
+    subtheme: segments.length > 1 ? segments[segments.length - 1] : "",
+  };
+}
+
+/**
+ * Map a Brickset minifigure theme onto the theme name used for sets.
+ * Unknown themes pass through untouched.
+ * @param {unknown} rawTheme
+ * @returns {string}
+ */
+export function normalizeTheme(rawTheme) {
+  const theme = String(rawTheme ?? "")
+    .replace(/\s+/g, " ")
+    .trim();
+  return THEME_ALIASES.get(theme.toLowerCase()) ?? theme;
+}
+
+/**
+ * Build a lookup of normalised ID -> minifigure record from raw Brickset
+ * minifig objects. First entry wins, so a prefix query's results are not
+ * overwritten by a later exact query for the same ID.
+ * @param {Array<object>} minifigs
+ * @returns {Map<string, {id: string, sku: string, name: string, theme: string, subtheme: string}>}
+ */
+export function buildMinifigMap(minifigs) {
+  const map = new Map();
+  for (const m of minifigs || []) {
+    const id = normalizeMinifigId(m?.minifigNumber);
+    if (!id || map.has(id)) continue;
+
+    const { theme, subtheme } = parseMinifigCategory(m?.category);
+    map.set(id, {
+      id,
+      sku: id.toUpperCase(),
+      name: String(m?.name ?? "").trim(),
+      theme,
+      subtheme,
+    });
+  }
+  return map;
+}
+
+/* ---------------- getMinifigCollection (one query) ---------------- */
+async function getMinifigCollectionQuery(apiKey, username, password, query) {
+  // Two attempts: the second only if the first hash was rejected.
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const userHash = await getUserHash(apiKey, username, password, attempt > 0);
+    const data = await bricksetPost(
+      "getMinifigCollection",
+      { apiKey, userHash, params: JSON.stringify({ query, pageSize: MINIFIG_PAGE_SIZE }) },
+      "getMinifigCollection"
+    );
+
+    if (data.status === "error") {
+      const message = data.message || "";
+      if (/user hash/i.test(message) && attempt === 0) continue; // refresh + retry once
+      throwBricksetDataError("getMinifigCollection", message);
+    }
+
+    return Array.isArray(data.minifigs) ? data.minifigs : [];
+  }
+  return [];
+}
+
+/**
+ * Resolve minifigure catalogue data for a list of IDs.
+ * Pass 1 issues one prefix query per group and keeps every minifigure it
+ * sees, so neighbours come back free. Pass 2 issues an exact query for
+ * anything pass 1 did not resolve.
+ *
+ * Errors propagate. A rate limit or daily quota stop is a real stop, and
+ * the caller imports in chunks so the run can be resumed.
+ *
+ * @param {Array<string>} ids - raw IDs as pasted
+ * @param {Object} env - process.env
+ * @returns {Promise<Map<string, object>>} normalised ID -> minifigure record
+ */
+export async function fetchMinifigs(ids, env) {
+  const { apiKey, username, password } = credsFromEnv(env);
+
+  const normalized = [...new Set((ids || []).map(normalizeMinifigId).filter(Boolean))];
+  const found = new Map();
+  if (normalized.length === 0) return found;
+
+  // Pass 1: one call per prefix group, caching every minifigure returned.
+  for (const prefix of groupIdsByPrefix(normalized).keys()) {
+    const minifigs = await getMinifigCollectionQuery(apiKey, username, password, prefix);
+    for (const [id, record] of buildMinifigMap(minifigs)) {
+      if (!found.has(id)) found.set(id, record);
+    }
+  }
+
+  // Pass 2: exact query for anything a prefix group missed.
+  for (const id of normalized) {
+    if (found.has(id)) continue;
+    const minifigs = await getMinifigCollectionQuery(apiKey, username, password, id);
+    for (const [foundId, record] of buildMinifigMap(minifigs)) {
+      if (!found.has(foundId)) found.set(foundId, record);
+    }
+  }
+
+  return found;
 }
