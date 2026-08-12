@@ -1,5 +1,7 @@
 // app/routes/app.import.jsx
 
+/* global process */
+
 import { authenticate } from "../shopify.server.js";
 import { importSets } from "../lib/import-products.server.js";
 
