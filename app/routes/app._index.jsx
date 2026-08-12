@@ -235,7 +235,9 @@ export default function LegoImporterIndex() {
         ? (setsResult.importedCount / setsResult.totalRequested) * 100
         : 0;
 
-  const summaryText = result ? `${result.importedCount} of ${result.totalRequested} processed` : "";
+  // Counts products actually created. Skipped duplicates and errors are
+  // processed but not created, so "processed" here would read as a miscount.
+  const summaryText = result ? `${result.importedCount} of ${result.totalRequested} created` : "";
 
   return (
     <s-page>

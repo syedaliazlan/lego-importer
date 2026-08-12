@@ -13,8 +13,11 @@
 //     because the product already exists at that point and the team amends
 //     pricing by hand anyway
 
-// "Construction Set Toys" in the Shopify Standard Product Taxonomy.
+// Shopify Standard Product Taxonomy categories.
+// Sets are construction toys; minifigures are filed as action figures, which is
+// what the shop's existing hand-built minifigure listings use.
 export const CONSTRUCTION_TOYS_CATEGORY_ID = "gid://shopify/TaxonomyCategory/tg-5-7-8";
+export const ACTION_FIGURES_CATEGORY_ID = "gid://shopify/TaxonomyCategory/tg-5-8-1-1";
 
 /* ===============================================================
    LOOKUPS

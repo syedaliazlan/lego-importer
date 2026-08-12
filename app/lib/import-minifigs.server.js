@@ -14,7 +14,7 @@
 
 import { fetchMinifigs, normalizeMinifigId } from "./brickset.server.js";
 import {
-  CONSTRUCTION_TOYS_CATEGORY_ID,
+  ACTION_FIGURES_CATEGORY_ID,
   attachImages,
   checkProductExists,
   createProduct,
@@ -99,7 +99,7 @@ export function buildMinifigProductInput(minifig, env = {}) {
     descriptionHtml,
     vendor: minifig.theme || env.DEFAULT_VENDOR || "LEGO", // theme doubles as vendor, same as sets
     productType: "Minifigures",
-    category: CONSTRUCTION_TOYS_CATEGORY_ID,
+    category: ACTION_FIGURES_CATEGORY_ID,
     status: "DRAFT",
     tags: ["brickset-imported", "minifigure"],
     metafields,

@@ -229,6 +229,9 @@ test("buildMinifigProductInput: sets the fields the shop relies on", () => {
   const input = buildMinifigProductInput(OBI_WAN, {});
 
   assert.equal(input.productType, "Minifigures");
+  // Action Figures, matching the shop's existing minifigure listings.
+  // Sets use Construction Set Toys; minifigures deliberately do not.
+  assert.equal(input.category, "gid://shopify/TaxonomyCategory/tg-5-8-1-1");
   assert.equal(input.status, "DRAFT");
   assert.equal(input.vendor, "Star Wars");
   assert.deepEqual(input.tags, ["brickset-imported", "minifigure"]);

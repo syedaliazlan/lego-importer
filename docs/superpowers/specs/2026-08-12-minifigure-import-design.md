@@ -69,7 +69,7 @@ onto its own CDN during import, so there is no ongoing hotlink.
 | Barcode | uppercase ID, `SW0197` |
 | Vendor | theme, `Star Wars` |
 | Product type | `Minifigures` |
-| Category | `gid://shopify/TaxonomyCategory/tg-5-7-8`, same as sets |
+| Category | Action Figures, `gid://shopify/TaxonomyCategory/tg-5-8-1-1` |
 | Status | `DRAFT` |
 | Inventory | tracked, policy `DENY` |
 | Tags | `brickset-imported`, `minifigure` |
@@ -182,5 +182,6 @@ development store covering a known good ID, an unknown ID and a duplicate.
 - Pricing. The team sets prices by hand after import.
 - Backfilling barcodes onto existing minifigure listings. Those already exist
   without barcodes and would need the same treatment as the set backfill.
-- Minifigure specific Shopify category. Reusing the sets category keeps
-  storefront collections and filters behaving.
+- Naming for Collectible Minifigures. The shop has no existing `col*` listing to
+  copy, so the doubled-word rule described above is a judgement call and may
+  need revisiting once they list some.
