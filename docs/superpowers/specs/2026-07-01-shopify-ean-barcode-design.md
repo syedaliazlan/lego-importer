@@ -4,6 +4,8 @@
 **Author:** Ali (Devonic) for Retired Sets / National Brick Events (Joe, Nick)
 **Status:** Approved to build
 
+> **Superseded 2026-09-12.** Joe asked (2026-09-05) for every available barcode to be written so the till scans UPC boxes too. The importer and backfill now write EAN and UPC as typed barcodes on Admin API 2026-10 and the backfill is a merge rather than fill-only. The "EAN only, no UPC fallback" decision in section 3 no longer applies; UPC is written as its own typed row, never as a substitute for a missing EAN.
+
 ## 1. Background & goal
 
 Retired Sets is moving to Shopify POS (Aylesbury first, as a POS Pro test). For staff to scan a boxed LEGO set at the till, the set's **EAN barcode** must live in the Shopify variant `barcode` field (POS scans that field, not a metafield). Brickset already carries the EAN for each set in its API. The importer currently creates products with SKU, metafields, images and inventory tracking, but **never fetches or stores the EAN**.

@@ -1,6 +1,7 @@
 // app/lib/import-products.server.js
 
 import { fetchSet } from "./brickset.server.js";
+import { bricksetBarcodes, describeBarcodes } from "./barcodes.js";
 import {
   CONSTRUCTION_TOYS_CATEGORY_ID,
   attachImages,
@@ -152,13 +153,15 @@ export async function importSets(auth, ids, env) {
         continue;
       }
 
-      // EAN from Brickset goes in the variant barcode so the set scans at
-      // Shopify POS. Left empty when Brickset has no EAN, which the result
-      // message below flags.
+      // Every barcode Brickset knows goes onto the variant with its type
+      // (EAN for UK/EU boxes, UPC for North American boxes) so the set scans
+      // at Shopify POS whichever box is on the counter. Left empty when
+      // Brickset has neither, which the result message below flags.
+      const barcodes = bricksetBarcodes({ ean: set.ean, upc: set.upc });
       await updateVariantFields(admin, {
         productId,
         variantId: variant.variantId,
-        barcode: set.ean,
+        barcodes,
         label: setNum,
       });
 
@@ -179,8 +182,10 @@ export async function importSets(auth, ids, env) {
 
       importedCount += 1;
 
-      // Note whether Brickset supplied an EAN so missing barcodes surface in the UI.
-      const barcodeNote = set.ean ? `barcode ${set.ean}` : "no EAN in Brickset";
+      // Note which barcodes Brickset supplied so missing ones surface in the UI.
+      const barcodeNote = barcodes.length
+        ? `barcodes ${describeBarcodes(barcodes)}`
+        : "no barcode in Brickset";
 
       results.push({
         id: setNum,
@@ -191,6 +196,8 @@ export async function importSets(auth, ids, env) {
         shopifyProductId: productId,
         imageCount: attachedCount,
         ean: set.ean || null,
+        upc: set.upc || null,
+        barcodes,
       });
     } catch (err) {
       console.error(`[${setNum}] Import failed:`, err?.message || "Unknown error");

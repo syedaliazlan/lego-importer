@@ -1,17 +1,24 @@
 // app/lib/backfill-barcodes.server.js
 //
-// Backfills EAN barcodes onto EXISTING Shopify products.
+// Backfills EAN and UPC barcodes onto EXISTING Shopify products.
 // Works one page ("chunk") of variants at a time so each request stays short
 // and the client can loop through the whole catalogue with live progress.
 //
+// This is a MERGE, not a fill: a variant that already has its EAN still gets
+// the UPC added, and nothing already on the variant is ever removed or
+// retyped (except an untyped row that matches Brickset, which gains its type).
+// Requires Admin API 2026-10, where a variant holds up to 20 typed barcodes.
+//
 // Flow per chunk:
-//   1. Read a page of product variants (id, sku, barcode, product).
+//   1. Read a page of product variants (id, sku, barcode, barcodes, product).
 //   2. Match each variant's SKU to a Brickset set number.
-//   3. One batched Brickset getSets call resolves EANs for the page.
-//   4. Fill the barcode on variants that are empty and have an EAN.
+//   3. One batched Brickset getSets call resolves EAN + UPC for the page.
+//   4. Merge Brickset's barcodes into each variant's existing list and write
+//      only the variants whose list actually changed.
 //      Preview mode does everything except the write.
 
-import { fetchEansForSetNumbers } from "./brickset.server.js";
+import { fetchBarcodesForSetNumbers } from "./brickset.server.js";
+import { mergeBarcodes } from "./barcodes.js";
 
 /* ===============================================================
    PURE HELPERS (no I/O, unit tested)
@@ -39,44 +46,90 @@ export function parseSku(rawSku) {
 }
 
 /**
- * Build a map of clean set number -> trimmed EAN from Brickset set objects.
- * Presence of a key means the set was found (EAN may still be "").
+ * Build a map of clean set number -> { ean, upc } from Brickset set objects.
+ * Presence of a key means the set was found (both values may still be "").
+ * Brickset's shape is `set.barcode.EAN` / `set.barcode.UPC` (observed).
  * @param {Array<object>} bricksetSets
- * @returns {Map<string, string>}
+ * @returns {Map<string, {ean: string, upc: string}>}
  */
-export function buildEanMap(bricksetSets) {
+export function buildBarcodeMap(bricksetSets) {
   const map = new Map();
   for (const s of bricksetSets || []) {
     const clean = String(s?.number ?? "").trim();
     if (!clean) continue;
-    const ean = (s?.barcode?.EAN || "").trim();
-    // If a set appears twice, prefer the entry that actually carries an EAN.
-    if (!map.has(clean) || (!map.get(clean) && ean)) {
-      map.set(clean, ean);
-    }
+    const entry = {
+      ean: String(s?.barcode?.EAN ?? "").trim(),
+      upc: String(s?.barcode?.UPC ?? "").trim(),
+    };
+    // If a set appears twice, prefer the entry that carries more data.
+    const prev = map.get(clean);
+    const score = (e) => (e.ean ? 1 : 0) + (e.upc ? 1 : 0);
+    if (!prev || score(entry) > score(prev)) map.set(clean, entry);
   }
   return map;
 }
 
 /**
- * Decide what to do with a single variant.
- * Fill-only: a variant that already has a barcode is left untouched.
- * @returns {{outcome: "alreadySet"|"skipped"|"notFound"|"missingEan"|"fill", ean?: string}}
+ * Read the rows of ProductVariant.barcodes off a variant node.
+ * Shape per the 2026-10 docs: barcodes { nodes { value type } }.
+ * @returns {Array<{value: string, type: string|null}>}
  */
-export function classifyVariant(variant, parsed, eanMap) {
-  const currentBarcode = (variant?.barcode || "").trim();
-  if (currentBarcode) return { outcome: "alreadySet" };
-  if (!parsed) return { outcome: "skipped" };
-  if (!eanMap.has(parsed.clean)) return { outcome: "notFound" };
-  const ean = eanMap.get(parsed.clean);
-  if (!ean) return { outcome: "missingEan" };
-  return { outcome: "fill", ean };
+export function existingBarcodes(variant) {
+  const nodes = variant?.barcodes?.nodes;
+  if (Array.isArray(nodes)) return nodes;
+  // Tolerate an edges shape too, in case a caller asked for it.
+  const edges = variant?.barcodes?.edges;
+  if (Array.isArray(edges)) return edges.map((e) => e?.node).filter(Boolean);
+  return [];
+}
+
+/**
+ * Decide what to do with a single variant.
+ * @returns {{
+ *   outcome: "skipped"|"notFound"|"noBricksetData"|"unchanged"|"update",
+ *   existingCount: number,
+ *   barcodes?: Array<{value: string, type: string|null}>,
+ *   added?: Array<{value: string, type: string|null}>,
+ *   retyped?: Array<{value: string, type: string|null}>,
+ *   notAdded?: Array<{value: string, type: string|null, reason: string}>,
+ * }}
+ */
+export function classifyVariant(variant, parsed, barcodeMap) {
+  const existing = existingBarcodes(variant);
+  const legacyBarcode = String(variant?.barcode ?? "").trim();
+  const existingCount = existing.filter((r) => String(r?.value ?? "").trim()).length || (legacyBarcode ? 1 : 0);
+
+  if (!parsed) return { outcome: "skipped", existingCount };
+  if (!barcodeMap.has(parsed.clean)) return { outcome: "notFound", existingCount };
+
+  const brickset = barcodeMap.get(parsed.clean);
+  if (!brickset.ean && !brickset.upc) return { outcome: "noBricksetData", existingCount };
+
+  const merged = mergeBarcodes({ existing, legacyBarcode, brickset });
+  if (!merged.changed) return { outcome: "unchanged", existingCount };
+
+  return {
+    outcome: "update",
+    existingCount,
+    barcodes: merged.barcodes,
+    added: merged.added,
+    retyped: merged.retyped,
+    notAdded: merged.notAdded,
+  };
 }
 
 /* ===============================================================
    SHOPIFY I/O
 =============================================================== */
 
+// Field names confirmed on shopify.dev for Admin API 2026-10 (read 2026-09-12):
+//   ProductVariant.barcodes(first:) -> ProductVariantBarcodeConnection { nodes, edges, pageInfo }
+//   ProductVariantBarcode { value: String!, type: BarcodeType }
+//   ProductVariant.barcode -> String, deprecated ("Use `barcodes` instead."),
+//     "returns the first entry in `barcodes`" when there is more than one.
+//   https://shopify.dev/docs/api/admin-graphql/2026-10/objects/ProductVariant
+//   https://shopify.dev/docs/api/admin-graphql/2026-10/connections/ProductVariantBarcodeConnection
+// The legacy `barcode` is still read as a safety net (see mergeBarcodes).
 const PRODUCT_VARIANTS_QUERY = `
   query BackfillVariants($first: Int!, $after: String) {
     productVariants(first: $first, after: $after) {
@@ -85,6 +138,9 @@ const PRODUCT_VARIANTS_QUERY = `
           id
           sku
           barcode
+          barcodes(first: 20) {
+            nodes { value type }
+          }
           product { id title }
         }
       }
@@ -93,10 +149,28 @@ const PRODUCT_VARIANTS_QUERY = `
   }
 `;
 
-const VARIANT_BARCODE_UPDATE = `
-  mutation BackfillSetBarcode($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
+// Write path confirmed on shopify.dev for Admin API 2026-10 (read 2026-09-12):
+//   ProductVariantsBulkInput.barcodes: [BarcodeInput!]
+//     "Replaces the entire barcode set. A variant accepts up to 20 barcodes,
+//      and a given variant input can't set both `barcode` and `barcodes`."
+//   ProductVariantsBulkInput.barcode: String, deprecated ("Use `barcodes` instead.")
+//     "If `null` is provided on a variant with >1 barcode, the first barcode
+//      will be erased and the next will be returned in the `barcode` field."
+//   BarcodeInput { value: String!, type: BarcodeType }  (type optional; null = stored as entered)
+//   https://shopify.dev/docs/api/admin-graphql/2026-10/input-objects/ProductVariantsBulkInput
+//   https://shopify.dev/docs/api/admin-graphql/2026-10/input-objects/BarcodeInput
+//   https://shopify.dev/docs/api/admin-graphql/2026-10/mutations/productVariantsBulkUpdate
+// So this mutation sends ONLY `barcodes`, never `barcode`, and always the full
+// merged list. One variant per call so a format-validation failure on one
+// variant (say a malformed UPC from Brickset) is reported for that variant
+// alone and the rest of the page still writes.
+const VARIANT_BARCODES_UPDATE = `
+  mutation BackfillSetBarcodes($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
     productVariantsBulkUpdate(productId: $productId, variants: $variants) {
-      productVariants { id barcode }
+      productVariants {
+        id
+        barcodes(first: 20) { nodes { value type } }
+      }
       userErrors { field message }
     }
   }
@@ -126,6 +200,16 @@ async function graphqlWithRetry(admin, query, variables, attempts = 4) {
   return json;
 }
 
+function formatUserErrors(userErrors) {
+  return userErrors
+    .map((e) => {
+      const field = Array.isArray(e?.field) ? e.field.join(".") : e?.field;
+      return field ? `${field}: ${e.message}` : e?.message;
+    })
+    .filter(Boolean)
+    .join("; ");
+}
+
 /**
  * Process one page of the catalogue.
  * @param admin  authenticated admin GraphQL client
@@ -153,91 +237,106 @@ export async function backfillChunk(admin, env, opts = {}) {
 
   const items = edges.map((e) => ({ node: e.node, parsed: parseSku(e.node.sku) }));
 
-  // 2. Which variants need a Brickset lookup (empty barcode + parseable SKU).
-  const toLookup = items.filter(
-    (it) => (it.node.barcode || "").trim() === "" && it.parsed
-  );
+  // 2. Every variant with a parseable SKU needs a Brickset lookup, because a
+  //    variant that already has its EAN may still be missing its UPC.
+  const toLookup = items.filter((it) => it.parsed);
 
   // 3. Batched Brickset lookup for the page.
-  let eanMap = new Map();
+  let barcodeMap = new Map();
   if (toLookup.length) {
-    const sets = await fetchEansForSetNumbers(toLookup.map((it) => it.parsed.query), env);
-    eanMap = buildEanMap(sets);
+    const sets = await fetchBarcodesForSetNumbers(toLookup.map((it) => it.parsed.query), env);
+    barcodeMap = buildBarcodeMap(sets);
   }
 
-  // 4. Classify + collect fills grouped by product.
+  // 4. Classify + collect updates.
   const report = {
     processed: items.length,
-    alreadySet: 0,
-    filled: 0,
-    wouldFill: 0,
+    updated: 0,
+    wouldUpdate: 0,
+    unchanged: 0,
     skipped: 0,
-    missingEan: [],
+    barcodesAdded: 0,
+    barcodesRetyped: 0,
+    noBricksetData: [],
     notFound: [],
+    notAdded: [],
     errors: [],
   };
 
-  const fillsByProduct = new Map(); // productId -> [{ id, barcode, sku }]
+  const updates = []; // [{ productId, variantId, sku, barcodes, added, retyped }]
 
   for (const it of items) {
     const sku = (it.node.sku || "").trim();
-    const c = classifyVariant(it.node, it.parsed, eanMap);
+    const c = classifyVariant(it.node, it.parsed, barcodeMap);
+    const flag = () => ({
+      setNumber: it.parsed?.clean || sku,
+      productName: it.node.product?.title || "",
+      existingCount: c.existingCount,
+    });
     switch (c.outcome) {
-      case "alreadySet":
-        report.alreadySet++;
-        break;
       case "skipped":
         report.skipped++;
         break;
       case "notFound":
-        report.notFound.push({
-          setNumber: it.parsed?.clean || sku,
-          productName: it.node.product?.title || "",
-        });
+        report.notFound.push(flag());
         break;
-      case "missingEan":
-        report.missingEan.push({
-          setNumber: it.parsed?.clean || sku,
-          productName: it.node.product?.title || "",
-        });
+      case "noBricksetData":
+        report.noBricksetData.push(flag());
         break;
-      case "fill": {
+      case "unchanged":
+        report.unchanged++;
+        break;
+      case "update": {
         const pid = it.node.product?.id;
         if (!pid) {
           report.errors.push({ sku, message: "variant has no product id" });
           break;
         }
-        if (!fillsByProduct.has(pid)) fillsByProduct.set(pid, []);
-        fillsByProduct.get(pid).push({ id: it.node.id, barcode: c.ean, sku });
+        for (const n of c.notAdded || []) {
+          report.notAdded.push({ sku, value: n.value, type: n.type, reason: n.reason });
+        }
+        updates.push({
+          productId: pid,
+          variantId: it.node.id,
+          sku,
+          barcodes: c.barcodes,
+          added: c.added || [],
+          retyped: c.retyped || [],
+        });
         break;
       }
     }
   }
 
-  const totalFills = [...fillsByProduct.values()].reduce((n, a) => n + a.length, 0);
-
-  // 5. Write (commit only). One mutation per product.
-  if (mode === "commit" && totalFills) {
-    for (const [productId, variants] of fillsByProduct) {
+  // 5. Write (commit only). One mutation per variant so one bad barcode fails
+  //    one variant, not the page.
+  if (mode === "commit") {
+    for (const u of updates) {
       try {
-        const json = await graphqlWithRetry(admin, VARIANT_BARCODE_UPDATE, {
-          productId,
-          variants: variants.map((v) => ({ id: v.id, barcode: v.barcode })),
+        const json = await graphqlWithRetry(admin, VARIANT_BARCODES_UPDATE, {
+          productId: u.productId,
+          variants: [{ id: u.variantId, barcodes: u.barcodes }],
         });
         const userErrors = json.data?.productVariantsBulkUpdate?.userErrors || [];
         if (json.errors?.length) {
-          for (const v of variants) report.errors.push({ sku: v.sku, message: json.errors[0].message });
+          report.errors.push({ sku: u.sku, message: json.errors[0].message });
         } else if (userErrors.length) {
-          for (const v of variants) report.errors.push({ sku: v.sku, message: userErrors[0].message });
+          report.errors.push({ sku: u.sku, message: formatUserErrors(userErrors) });
         } else {
-          report.filled += json.data?.productVariantsBulkUpdate?.productVariants?.length || variants.length;
+          report.updated++;
+          report.barcodesAdded += u.added.length;
+          report.barcodesRetyped += u.retyped.length;
         }
       } catch (err) {
-        for (const v of variants) report.errors.push({ sku: v.sku, message: err.message });
+        report.errors.push({ sku: u.sku, message: err.message });
       }
     }
   } else {
-    report.wouldFill = totalFills;
+    report.wouldUpdate = updates.length;
+    for (const u of updates) {
+      report.barcodesAdded += u.added.length;
+      report.barcodesRetyped += u.retyped.length;
+    }
   }
 
   return {

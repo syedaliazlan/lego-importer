@@ -207,10 +207,20 @@ export async function getFirstVariant(admin, productId, label = "") {
   return { ok: true, variantId: variant.id, inventoryItemId: variant.inventoryItem?.id };
 }
 
+// Selection uses `barcodes` (Admin API 2026-10). The old single `barcode`
+// field is deprecated there ("Use `barcodes` instead.") and only mirrors the
+// first entry of the list.
+//   https://shopify.dev/docs/api/admin-graphql/2026-10/objects/ProductVariant
 const VARIANTS_BULK_UPDATE = `
   mutation productVariantsBulkUpdate($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
     productVariantsBulkUpdate(productId: $productId, variants: $variants) {
-      productVariants { id sku barcode inventoryPolicy inventoryItem { id tracked } }
+      productVariants {
+        id
+        sku
+        inventoryPolicy
+        barcodes(first: 20) { nodes { value type } }
+        inventoryItem { id tracked }
+      }
       userErrors { field message }
     }
   }
@@ -244,17 +254,33 @@ async function bulkUpdateVariant(admin, productId, variantInput, label, what) {
 
 /**
  * Set the variant fields we control at import time.
- * `barcode` carries the set's EAN, or the minifigure's catalogue ID.
- * Passing null leaves the barcode empty.
+ * `barcodes` is the full typed list for a brand new variant: the set's EAN
+ * and UPC from Brickset, or the minifigure's catalogue ID (untyped).
+ * An empty list leaves the variant with no barcode.
+ *
+ * Input shape confirmed on shopify.dev for Admin API 2026-10 (read 2026-09-12):
+ *   ProductVariantsBulkInput.barcodes: [BarcodeInput!]
+ *     "Replaces the entire barcode set. A variant accepts up to 20 barcodes,
+ *      and a given variant input can't set both `barcode` and `barcodes`."
+ *   BarcodeInput { value: String!, type: BarcodeType }
+ *     type: "A `null` format denotes no type provided on write and the value
+ *      is stored as entered." Typed values are validated against their format.
+ *   The legacy ProductVariantsBulkInput.barcode is deprecated ("Use `barcodes`
+ *   instead.") and is NOT sent here, because both cannot be set together.
+ *   https://shopify.dev/docs/api/admin-graphql/2026-10/input-objects/ProductVariantsBulkInput
+ *   https://shopify.dev/docs/api/admin-graphql/2026-10/input-objects/BarcodeInput
+ *
+ * @param {Array<{value: string, type?: string|null}>} [barcodes]
  */
-export async function updateVariantFields(admin, { productId, variantId, barcode, label = "" }) {
-  return bulkUpdateVariant(
-    admin,
-    productId,
-    { id: variantId, inventoryPolicy: "DENY", barcode: barcode || null },
-    label,
-    "Variant update"
-  );
+export async function updateVariantFields(admin, { productId, variantId, barcodes, label = "" }) {
+  const rows = (barcodes || [])
+    .filter((b) => b && String(b.value ?? "").trim())
+    .map((b) => ({ value: String(b.value).trim(), type: b.type || null }));
+
+  const input = { id: variantId, inventoryPolicy: "DENY" };
+  if (rows.length) input.barcodes = rows;
+
+  return bulkUpdateVariant(admin, productId, input, label, "Variant update");
 }
 
 /**

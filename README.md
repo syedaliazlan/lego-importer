@@ -23,6 +23,7 @@ A fully custom **Remix + Shopify GraphQL Admin App** that imports LEGO sets dire
 | **Product category set** to "Construction Set Toys" | ✔ |
 | **Vendor set** to theme/brand (e.g., "Harry Potter", "Star Wars") | ✔ |
 | **Product type** set to "Sets" | ✔ |
+| **Barcodes from Brickset** written with their type (EAN and UPC), plus an in-app backfill for existing products (Admin API 2026-10) | ✔ |
 | Progress table + UI import feedback | ✔ |
 
 ---
@@ -113,6 +114,7 @@ Adventure Peely & Cuddle Team Leader 40760 | BrickHeadz | LEGO
 - **Inventory Policy:** Deny (don't allow selling when out of stock)
 - **Sales Channels:** All available channels automatically selected
 - **Tags:** `brickset-imported`, `year:{year}`
+- **Barcodes:** every barcode Brickset has for the set, each with its type: EAN (UK and EU boxes) and UPC (North American boxes). A variant can hold up to 20 typed barcodes on Admin API 2026-10. The **Backfill barcodes** page merges the same into existing products: what is already on a product is kept, only missing barcodes are added, and an untyped barcode that matches Brickset gains its type.
 
 ---
 

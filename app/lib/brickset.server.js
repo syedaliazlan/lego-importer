@@ -202,16 +202,19 @@ export async function fetchSet(setNumber, env) {
     subtheme: s.subtheme ?? "",
     description: s.extendedData?.description ?? s.notes ?? "",
     bricksetURL: s.bricksetURL || "",
-    ean: (s.barcode?.EAN || "").trim(), // EAN-13 for Shopify POS barcode scanning
-    upc: (s.barcode?.UPC || "").trim(), // US UPC; not written to Shopify (won't match UK/EU boxes)
+    // Both go onto the variant as typed barcodes (EAN-13 for UK/EU boxes,
+    // UPC-A for North American boxes) so the till scans either box.
+    ean: (s.barcode?.EAN || "").trim(),
+    upc: (s.barcode?.UPC || "").trim(),
     gallery,
   };
 }
 
 /* ===============================================================
-   BATCH EAN LOOKUP, used by the barcode backfill.
+   BATCH BARCODE LOOKUP, used by the barcode backfill.
    getSets accepts a comma-delimited setNumber list; pageSize max 500,
-   so one rate-limited call resolves up to 500 sets.
+   so one rate-limited call resolves up to 500 sets. Each returned set
+   carries barcode: { EAN, UPC } (observed; either may be empty).
 =============================================================== */
 async function getSetsBatch(apiKey, username, password, batch) {
   // Two attempts: the second only if the first hash was rejected.
@@ -234,7 +237,7 @@ async function getSetsBatch(apiKey, username, password, batch) {
   return [];
 }
 
-export async function fetchEansForSetNumbers(setNumbers, env) {
+export async function fetchBarcodesForSetNumbers(setNumbers, env) {
   const { apiKey, username, password } = credsFromEnv(env);
 
   const unique = [...new Set((setNumbers || []).filter(Boolean))];

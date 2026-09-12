@@ -1,6 +1,8 @@
 // app/routes/app.backfill.jsx
 //
-// Backfill EAN barcodes onto existing products.
+// Backfill EAN and UPC barcodes onto existing products (Admin API 2026-10,
+// typed multi-barcodes). A merge: what a variant already has is kept, and
+// whatever Brickset knows and the variant lacks is added with its type.
 // The action processes ONE page ("chunk") of the catalogue per request; the
 // page component loops through chunks (following the returned cursor) so a
 // large catalogue is processed without any single request timing out.
@@ -40,12 +42,15 @@ export async function action({ request }) {
 const emptyTotals = () => ({
   chunks: 0,
   processed: 0,
-  alreadySet: 0,
-  filled: 0,
-  wouldFill: 0,
+  updated: 0,
+  wouldUpdate: 0,
+  unchanged: 0,
   skipped: 0,
-  missingEan: [],
+  barcodesAdded: 0,
+  barcodesRetyped: 0,
+  noBricksetData: [],
   notFound: [],
+  notAdded: [],
   errors: [],
 });
 
@@ -53,12 +58,15 @@ function mergeTotals(t, d) {
   return {
     chunks: t.chunks + 1,
     processed: t.processed + (d.processed || 0),
-    alreadySet: t.alreadySet + (d.alreadySet || 0),
-    filled: t.filled + (d.filled || 0),
-    wouldFill: t.wouldFill + (d.wouldFill || 0),
+    updated: t.updated + (d.updated || 0),
+    wouldUpdate: t.wouldUpdate + (d.wouldUpdate || 0),
+    unchanged: t.unchanged + (d.unchanged || 0),
     skipped: t.skipped + (d.skipped || 0),
-    missingEan: t.missingEan.concat(d.missingEan || []),
+    barcodesAdded: t.barcodesAdded + (d.barcodesAdded || 0),
+    barcodesRetyped: t.barcodesRetyped + (d.barcodesRetyped || 0),
+    noBricksetData: t.noBricksetData.concat(d.noBricksetData || []),
     notFound: t.notFound.concat(d.notFound || []),
+    notAdded: t.notAdded.concat(d.notAdded || []),
     errors: t.errors.concat(d.errors || []),
   };
 }
@@ -159,21 +167,29 @@ export default function BackfillBarcodes() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [fetcher.data, fetcher.state]);
 
-  const filledLabel = mode === "commit" ? "Filled" : "Would fill";
-  const filledValue = mode === "commit" ? totals.filled : totals.wouldFill;
+  const updatedLabel = mode === "commit" ? "Products updated" : "Products to update";
+  const updatedValue = mode === "commit" ? totals.updated : totals.wouldUpdate;
   const hasRun = totals.chunks > 0;
   const lastError = fetcher.data?.error;
 
   const flagged = useMemo(() => {
+    const has = (r) => (r.existingCount ? `, already has ${r.existingCount}` : ", has none");
     const rows = [];
-    for (const r of totals.missingEan) {
-      rows.push({ setNumber: r.setNumber, productName: r.productName, reason: "No EAN in Brickset" });
+    for (const r of totals.noBricksetData) {
+      rows.push({ setNumber: r.setNumber, productName: r.productName, reason: `No barcode in Brickset${has(r)}` });
     }
     for (const r of totals.notFound) {
-      rows.push({ setNumber: r.setNumber, productName: r.productName, reason: "Not found on Brickset" });
+      rows.push({ setNumber: r.setNumber, productName: r.productName, reason: `Not found on Brickset${has(r)}` });
+    }
+    for (const r of totals.notAdded) {
+      rows.push({
+        setNumber: r.sku,
+        productName: "",
+        reason: `${r.type || "Barcode"} ${r.value} not added: ${r.reason}`,
+      });
     }
     return rows;
-  }, [totals.missingEan, totals.notFound]);
+  }, [totals.noBricksetData, totals.notFound, totals.notAdded]);
 
   const flaggedDisplay = useMemo(() => {
     if (!flagged.length) return "None";
@@ -210,15 +226,18 @@ export default function BackfillBarcodes() {
 
       <div style={{ maxWidth: 800, margin: "24px auto", display: "flex", flexDirection: "column", gap: 24 }}>
         <section style={card}>
-          <h1 style={{ fontSize: 22, fontWeight: 600, marginBottom: 10 }}>Backfill EAN barcodes</h1>
+          <h1 style={{ fontSize: 22, fontWeight: 600, marginBottom: 10 }}>Backfill EAN and UPC barcodes</h1>
           <p style={{ marginBottom: 8, color: "#444" }}>
-            Goes through your existing products, matches each one to its Brickset set by SKU, and fills in the
-            EAN barcode so it scans at Shopify POS. Only empty barcodes are filled. Products that already have
-            a barcode are left untouched, so it is safe to run more than once.
+            Goes through your existing products, matches each one to its Brickset set by SKU, and adds every
+            barcode Brickset has for it, each with its type (EAN for UK and EU boxes, UPC for North American
+            boxes), so the till scans whichever box is on the counter. Barcodes already on a product are kept
+            exactly as they are; only missing ones are added, so it is safe to run more than once. A product
+            that already has its EAN still gets its UPC.
           </p>
           <p style={{ marginBottom: 20, color: "#444" }}>
             Run <strong>Preview</strong> first to see what would change and get the list of sets Brickset has no
-            EAN for. Nothing is written until you choose <strong>Run backfill</strong>.
+            barcode for. Nothing is written until you choose <strong>Run backfill</strong>. Needs Shopify Admin
+            API 2026-10, the first version with typed multi-barcodes.
           </p>
 
           <div style={{ display: "flex", gap: 12, flexWrap: "wrap" }}>
@@ -317,11 +336,20 @@ export default function BackfillBarcodes() {
 
             <div style={{ display: "grid", gridTemplateColumns: "repeat(3, 1fr)", gap: 12, marginBottom: 16 }}>
               <Stat label="Scanned" value={totals.processed} />
-              <Stat label={filledLabel} value={filledValue} highlight />
-              <Stat label="Already had one" value={totals.alreadySet} />
-              <Stat label="No EAN in Brickset" value={totals.missingEan.length} />
+              <Stat label={updatedLabel} value={updatedValue} highlight />
+              <Stat
+                label={mode === "commit" ? "Barcodes added" : "Barcodes to add"}
+                value={totals.barcodesAdded}
+                highlight
+              />
+              <Stat label="Already complete" value={totals.unchanged} />
+              <Stat label="No barcode in Brickset" value={totals.noBricksetData.length} />
               <Stat label="Not found on Brickset" value={totals.notFound.length} />
               <Stat label="Skipped (non-set SKU)" value={totals.skipped} />
+              <Stat
+                label={mode === "commit" ? "Existing barcodes given a type" : "Existing barcodes to give a type"}
+                value={totals.barcodesRetyped}
+              />
             </div>
 
             {totals.errors.length > 0 && (
@@ -330,12 +358,12 @@ export default function BackfillBarcodes() {
               </p>
             )}
 
-            {(totals.missingEan.length > 0 || totals.notFound.length > 0) && (
+            {flagged.length > 0 && (
               <div>
                 <p style={{ color: "#444", marginBottom: 8 }}>
-                  {totals.missingEan.length} set(s) have no EAN in Brickset and {totals.notFound.length} SKU(s)
-                  were not found on Brickset. Download the list to review the sets that could not be matched to
-                  a barcode automatically.
+                  {totals.noBricksetData.length} set(s) have no barcode in Brickset and {totals.notFound.length}{" "}
+                  SKU(s) were not found on Brickset. Download the list to review the sets that could not be
+                  matched to a barcode automatically.
                 </p>
                 <button
                   type="button"

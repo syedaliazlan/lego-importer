@@ -248,11 +248,13 @@ export async function importMinifigs(auth, ids, env) {
         continue;
       }
 
-      // No EAN exists for a minifigure, so the catalogue ID becomes the barcode.
+      // No EAN exists for a minifigure, so the catalogue ID becomes the
+      // barcode. It is not a GS1 code, so it is written with no type
+      // ("Custom" in the admin), which Shopify stores as entered.
       await updateVariantFields(admin, {
         productId,
         variantId: variant.variantId,
-        barcode: minifig.sku,
+        barcodes: [{ value: minifig.sku, type: null }],
         label: minifig.sku,
       });
 
