@@ -181,7 +181,8 @@ function sleep(ms) {
 }
 
 // Retry only on Shopify throttling; surface everything else to the caller.
-async function graphqlWithRetry(admin, query, variables, attempts = 4) {
+// Shared with the CSV upload (barcode-csv-apply.server.js).
+export async function graphqlWithRetry(admin, query, variables, attempts = 4) {
   let delay = 500;
   let json;
   for (let i = 0; i < attempts; i++) {
@@ -200,14 +201,36 @@ async function graphqlWithRetry(admin, query, variables, attempts = 4) {
   return json;
 }
 
-function formatUserErrors(userErrors) {
-  return userErrors
+export function formatUserErrors(userErrors) {
+  return (userErrors || [])
     .map((e) => {
       const field = Array.isArray(e?.field) ? e.field.join(".") : e?.field;
       return field ? `${field}: ${e.message}` : e?.message;
     })
     .filter(Boolean)
     .join("; ");
+}
+
+/**
+ * Replace a variant's whole barcode list with `barcodes` (the merged list).
+ * The ONE write path for barcodes on existing products: the backfill and the
+ * CSV upload both go through here, so they can never drift apart.
+ * Never throws.
+ * @returns {Promise<{ok: true} | {ok: false, message: string}>}
+ */
+export async function writeVariantBarcodes(admin, { productId, variantId, barcodes }) {
+  try {
+    const json = await graphqlWithRetry(admin, VARIANT_BARCODES_UPDATE, {
+      productId,
+      variants: [{ id: variantId, barcodes }],
+    });
+    if (json.errors?.length) return { ok: false, message: json.errors[0].message };
+    const userErrors = json.data?.productVariantsBulkUpdate?.userErrors || [];
+    if (userErrors.length) return { ok: false, message: formatUserErrors(userErrors) };
+    return { ok: true };
+  } catch (err) {
+    return { ok: false, message: err?.message || "Unknown error" };
+  }
 }
 
 /**
@@ -312,23 +335,17 @@ export async function backfillChunk(admin, env, opts = {}) {
   //    one variant, not the page.
   if (mode === "commit") {
     for (const u of updates) {
-      try {
-        const json = await graphqlWithRetry(admin, VARIANT_BARCODES_UPDATE, {
-          productId: u.productId,
-          variants: [{ id: u.variantId, barcodes: u.barcodes }],
-        });
-        const userErrors = json.data?.productVariantsBulkUpdate?.userErrors || [];
-        if (json.errors?.length) {
-          report.errors.push({ sku: u.sku, message: json.errors[0].message });
-        } else if (userErrors.length) {
-          report.errors.push({ sku: u.sku, message: formatUserErrors(userErrors) });
-        } else {
-          report.updated++;
-          report.barcodesAdded += u.added.length;
-          report.barcodesRetyped += u.retyped.length;
-        }
-      } catch (err) {
-        report.errors.push({ sku: u.sku, message: err.message });
+      const w = await writeVariantBarcodes(admin, {
+        productId: u.productId,
+        variantId: u.variantId,
+        barcodes: u.barcodes,
+      });
+      if (!w.ok) {
+        report.errors.push({ sku: u.sku, message: w.message });
+      } else {
+        report.updated++;
+        report.barcodesAdded += u.added.length;
+        report.barcodesRetyped += u.retyped.length;
       }
     }
   } else {

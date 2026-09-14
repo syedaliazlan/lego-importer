@@ -95,14 +95,19 @@ function sameList(a, b) {
 }
 
 /**
- * Merge Brickset's barcodes into the rows a variant already has.
+ * Merge new barcodes into the rows a variant already has.
+ *
+ * The new rows come from Brickset (`brickset`, turned into typed EAN and UPC
+ * rows by bricksetBarcodes) and/or from an explicit `candidates` list (the
+ * manual CSV upload, which may also carry a GTIN). Both go through the same
+ * rules, in that order.
  *
  * Rules:
  *   - Every existing row is kept, value and type untouched, in its order.
- *   - The Brickset EAN (type EAN) and UPC (type UPC) are appended when their
- *     VALUE is not already present. Presence is decided on the normalised
- *     value only, ignoring type, so an EAN stored as GTIN is not added twice.
- *   - An existing row with the same value and NO type takes the Brickset
+ *   - A candidate is appended when its VALUE is not already present. Presence
+ *     is decided on the normalised value only, ignoring type, so an EAN
+ *     stored as GTIN is not added twice.
+ *   - An existing row with the same value and NO type takes the candidate's
  *     type. This is how a legacy `barcode` write (untyped) becomes a typed
  *     EAN row instead of a duplicate.
  *   - The legacy `barcode` string is a safety net: if it is non-empty and its
@@ -116,6 +121,7 @@ function sameList(a, b) {
  * @param {Array<{value?: string, type?: string|null}>} [args.existing] rows from ProductVariant.barcodes
  * @param {string} [args.legacyBarcode] the deprecated ProductVariant.barcode string
  * @param {{ean?: string, upc?: string}} [args.brickset] Brickset barcode data
+ * @param {Array<{value?: string, type?: string|null}>} [args.candidates] explicit typed rows to add
  * @returns {{
  *   barcodes: Array<{value: string, type: string|null}>,
  *   changed: boolean,
@@ -124,7 +130,7 @@ function sameList(a, b) {
  *   notAdded: Array<{value: string, type: string|null, reason: string}>,
  * }}
  */
-export function mergeBarcodes({ existing, legacyBarcode, brickset } = {}) {
+export function mergeBarcodes({ existing, legacyBarcode, brickset, candidates } = {}) {
   // What Shopify holds today, as read. Compared against the result to decide
   // whether a write is needed at all.
   const current = (Array.isArray(existing) ? existing : [])
@@ -151,12 +157,18 @@ export function mergeBarcodes({ existing, legacyBarcode, brickset } = {}) {
   const retyped = [];
   const notAdded = [];
 
-  for (const candidate of bricksetBarcodes(brickset || {})) {
+  const wanted = bricksetBarcodes(brickset || {}).concat(
+    (Array.isArray(candidates) ? candidates : [])
+      .map((c) => ({ value: cleanValue(c?.value), type: cleanType(c?.type) }))
+      .filter((c) => c.value)
+  );
+
+  for (const candidate of wanted) {
     const key = normaliseBarcodeValue(candidate.value);
     const match = rows.find((r) => normaliseBarcodeValue(r.value) === key);
 
     if (match) {
-      if (!match.type) {
+      if (!match.type && candidate.type) {
         match.type = candidate.type;
         retyped.push({ value: match.value, type: match.type });
       }

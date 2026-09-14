@@ -13,6 +13,13 @@
 //     because the product already exists at that point and the team amends
 //     pricing by hand anyway
 
+import {
+  activationUpdates,
+  activeLocationIdsFromLevels,
+  locationsToActivate,
+  nonZeroAvailable,
+} from "./inventory-locations.js";
+
 // Shopify Standard Product Taxonomy categories.
 // Sets are construction toys; minifigures are filed as action figures, which is
 // what the shop's existing hand-built minifigure listings use.
@@ -296,6 +303,191 @@ export async function enableInventoryTracking(admin, { productId, variantId, lab
     "Inventory tracking update"
   );
   return Boolean(variant?.inventoryItem?.tracked);
+}
+
+/* ===============================================================
+   LOCATIONS
+=============================================================== */
+
+// `locations` returns only ACTIVE, non-legacy locations by default
+// (includeInactive: false, includeLegacy: false), which is exactly the set a
+// product should be stocked at. Read on shopify.dev for 2026-10 (2026-09-14):
+//   https://shopify.dev/docs/api/admin-graphql/2026-10/queries/locations
+//   https://shopify.dev/docs/api/admin-graphql/2026-10/objects/Location
+// Requires read_inventory (implied by write_inventory) or read_locations.
+const LOCATIONS_QUERY = `
+  query ImportLocations {
+    locations(first: 50) {
+      edges { node { id name } }
+    }
+  }
+`;
+
+/**
+ * Every active location on the shop. Fetched ONCE per import run and passed
+ * to stockAtAllLocations for each product.
+ * Returns [] on failure so the import carries on; the missing stocking is
+ * then reported on every product row.
+ * @returns {Promise<Array<{id: string, name: string}>>}
+ */
+export async function getActiveLocations(admin) {
+  try {
+    const resp = await admin.graphql(LOCATIONS_QUERY);
+    const json = await resp.json();
+    if (json.errors) {
+      console.warn("Could not fetch locations:", json.errors[0]?.message || "Unknown error");
+      return [];
+    }
+    return (json.data?.locations?.edges || [])
+      .map((e) => e?.node)
+      .filter((n) => n?.id)
+      .map((n) => ({ id: n.id, name: n.name || n.id }));
+  } catch (err) {
+    console.warn("Could not fetch locations, continuing without them:", err?.message);
+    return [];
+  }
+}
+
+// Where the inventory item is stocked right now. Field names read on
+// shopify.dev for 2026-10 (2026-09-14):
+//   InventoryItem.inventoryLevels(first:) -> InventoryLevelConnection
+//     "A list of the inventory item's quantities for each location that the
+//      inventory item can be stocked at."
+//   https://shopify.dev/docs/api/admin-graphql/2026-10/objects/InventoryItem
+const INVENTORY_ITEM_LEVELS_QUERY = `
+  query ImportInventoryLevels($id: ID!) {
+    inventoryItem(id: $id) {
+      id
+      inventoryLevels(first: 50) {
+        edges { node { location { id } } }
+      }
+    }
+  }
+`;
+
+// Mutation chosen: inventoryBulkToggleActivation, NOT inventoryActivate.
+//
+//   inventoryBulkToggleActivation(inventoryItemId: ID!,
+//       inventoryItemUpdates: [InventoryBulkToggleActivationInput!]!)
+//     InventoryBulkToggleActivationInput { locationId: ID!, activate: Boolean! }
+//     payload: inventoryItem, inventoryLevels ([InventoryLevel!], "The
+//       activated inventory levels."), userErrors { field message code }
+//   https://shopify.dev/docs/api/admin-graphql/2026-10/mutations/inventoryBulkToggleActivation
+//   https://shopify.dev/docs/api/admin-graphql/2026-10/input-objects/InventoryBulkToggleActivationInput
+//
+//   inventoryActivate(inventoryItemId: ID!, locationId: ID!, available: Int, onHand: Int)
+//   https://shopify.dev/docs/api/admin-graphql/2026-10/mutations/inventoryActivate
+//
+// Why: inventoryActivate takes ONE locationId per call, so stocking a product
+// at N locations is N mutations. inventoryBulkToggleActivation takes the
+// whole list in one call. Neither sets a quantity on activation other than
+// through inventoryActivate's optional `available`/`onHand`, and a level
+// created by activation starts at zero in every state, which is what the
+// shop wants ("stocked at every location at zero"). The payload's
+// inventoryLevels are read back with quantities(names: ["available"]) so a
+// non-zero level would be reported rather than assumed. Both require
+// write_inventory, which the app already has in shopify.app.toml.
+const INVENTORY_BULK_TOGGLE_ACTIVATION = `
+  mutation ImportStockAtLocations($inventoryItemId: ID!, $inventoryItemUpdates: [InventoryBulkToggleActivationInput!]!) {
+    inventoryBulkToggleActivation(inventoryItemId: $inventoryItemId, inventoryItemUpdates: $inventoryItemUpdates) {
+      inventoryItem { id }
+      inventoryLevels {
+        id
+        location { id name }
+        quantities(names: ["available"]) { name quantity }
+      }
+      userErrors { field message code }
+    }
+  }
+`;
+
+/**
+ * Stock the variant's inventory item at every active location, at zero.
+ * Reads where it is already stocked, activates only the missing locations in
+ * ONE inventoryBulkToggleActivation call, and never throws: a failure comes
+ * back as { ok: false, message } for the caller to put on the result row.
+ *
+ * @param admin
+ * @param {{inventoryItemId: string, locations: Array<{id: string, name: string}>, label?: string}} args
+ * @returns {Promise<{
+ *   ok: boolean,
+ *   activated: Array<{id: string, name: string}>,
+ *   alreadyActive: Array<{id: string, name: string}>,
+ *   nonZero: Array<{locationId: string, quantity: number}>,
+ *   message: string|null,
+ * }>}
+ */
+export async function stockAtAllLocations(admin, { inventoryItemId, locations, label = "" }) {
+  const result = { ok: false, activated: [], alreadyActive: [], nonZero: [], message: null };
+
+  if (!inventoryItemId) {
+    result.message = "variant has no inventory item";
+    return result;
+  }
+  if (!locations?.length) {
+    result.message = "could not read the shop's locations";
+    return result;
+  }
+
+  try {
+    const levelsResp = await admin.graphql(INVENTORY_ITEM_LEVELS_QUERY, { variables: { id: inventoryItemId } });
+    const levelsJson = await levelsResp.json();
+    if (levelsJson.errors) {
+      result.message = `could not read current locations: ${levelsJson.errors[0]?.message || "Unknown error"}`;
+      console.error(`[${label}] ${result.message}`);
+      return result;
+    }
+
+    const activeIds = activeLocationIdsFromLevels(levelsJson.data?.inventoryItem);
+    const plan = locationsToActivate({ locations, activeLocationIds: activeIds });
+    result.alreadyActive = plan.alreadyActive;
+
+    if (!plan.toActivate.length) {
+      result.ok = true;
+      return result;
+    }
+
+    const resp = await admin.graphql(INVENTORY_BULK_TOGGLE_ACTIVATION, {
+      variables: { inventoryItemId, inventoryItemUpdates: activationUpdates(plan.toActivate) },
+    });
+    const json = await resp.json();
+
+    if (json.errors) {
+      result.message = `activation failed: ${json.errors[0]?.message || "Unknown error"}`;
+      console.error(`[${label}] ${result.message}`);
+      return result;
+    }
+
+    const payload = json.data?.inventoryBulkToggleActivation;
+    const userErrors = payload?.userErrors || [];
+    if (userErrors.length) {
+      result.message = `activation failed: ${userErrors.map((e) => e.message).join("; ")}`;
+      console.error(`[${label}] ${result.message}`);
+      return result;
+    }
+
+    // Trust the payload over the plan: the activated levels are what Shopify
+    // says it created.
+    const returned = new Set((payload?.inventoryLevels || []).map((l) => l?.location?.id).filter(Boolean));
+    result.activated = plan.toActivate.filter((l) => returned.has(l.id));
+    const missed = plan.toActivate.filter((l) => !returned.has(l.id));
+    result.nonZero = nonZeroAvailable(payload?.inventoryLevels);
+
+    if (missed.length) {
+      result.message = `not activated at ${missed.map((l) => l.name).join(", ")}`;
+      console.error(`[${label}] ${result.message}`);
+      return result;
+    }
+    if (result.nonZero.length) {
+      console.warn(`[${label}] activated levels with non-zero available:`, result.nonZero);
+    }
+    result.ok = true;
+    return result;
+  } catch (err) {
+    result.message = `activation failed: ${err?.message || "Unknown error"}`;
+    console.error(`[${label}] ${result.message}`);
+    return result;
+  }
 }
 
 /**

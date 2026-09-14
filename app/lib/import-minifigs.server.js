@@ -13,16 +13,19 @@
 // scannable at the till from a printed label.
 
 import { fetchMinifigs, normalizeMinifigId } from "./brickset.server.js";
+import { describeStocking } from "./inventory-locations.js";
 import {
   ACTION_FIGURES_CATEGORY_ID,
   attachImages,
   checkProductExists,
   createProduct,
   enableInventoryTracking,
+  getActiveLocations,
   getAvailableChannels,
   getFirstVariant,
   publishToChannels,
   setVariantSku,
+  stockAtAllLocations,
   updateVariantFields,
 } from "./shopify-product.server.js";
 
@@ -179,6 +182,9 @@ export async function importMinifigs(auth, ids, env) {
   }
 
   const availableChannels = await getAvailableChannels(admin);
+  // Every active location, read once per chunk: each new product is stocked
+  // at all of them at zero so the POS never asks "stock at this location?".
+  const locations = await getActiveLocations(admin);
 
   const results = [];
   let importedCount = 0;
@@ -258,8 +264,16 @@ export async function importMinifigs(auth, ids, env) {
         label: minifig.sku,
       });
 
+      // Track inventory, then stock the item at every active location at
+      // zero. A stocking failure is reported on this row, never fatal.
+      let stocking = { ok: false, activated: [], alreadyActive: [], message: "variant has no inventory item" };
       if (variant.inventoryItemId) {
         await enableInventoryTracking(admin, { productId, variantId: variant.variantId, label: minifig.sku });
+        stocking = await stockAtAllLocations(admin, {
+          inventoryItemId: variant.inventoryItemId,
+          locations,
+          label: minifig.sku,
+        });
       }
 
       await setVariantSku(session, { variantId: variant.variantId, sku: minifig.sku, label: minifig.sku });
@@ -280,16 +294,21 @@ export async function importMinifigs(auth, ids, env) {
       importedCount += 1;
 
       const imageNote = hasImage ? `${attachedCount} images` : "no image on BrickLink";
+      const stockingNote = stocking.ok
+        ? describeStocking(stocking)
+        : `NOT stocked at every location (${stocking.message})`;
 
       results.push({
         id: raw,
         status: "created",
         errorCode: null,
-        message: `${productTitle} (${minifig.sku}): ${imageNote}, barcode ${minifig.sku}`,
+        message: `${productTitle} (${minifig.sku}): ${imageNote}, barcode ${minifig.sku}, ${stockingNote}`,
         shopifyProductTitle: productTitle,
         shopifyProductId: productId,
         imageCount: attachedCount,
         barcode: minifig.sku,
+        stockedAt: stocking.activated.concat(stocking.alreadyActive).map((l) => l.name),
+        stockingError: stocking.ok ? null : stocking.message,
       });
     } catch (err) {
       const errorMessage = err?.message || "Unknown error";

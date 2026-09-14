@@ -255,7 +255,7 @@ README.md
 The app requires the following scopes (configured in `shopify.app.toml`):
 
 - `write_products` - Create and update products
-- `write_inventory` - Enable inventory tracking and set SKU
+- `write_inventory` - Enable inventory tracking, set SKU, and stock every new product at every active location at zero (inventoryBulkToggleActivation)
 - `write_publications` - Publish products to sales channels
 
 ---

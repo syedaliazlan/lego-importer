@@ -2,16 +2,19 @@
 
 import { fetchSet } from "./brickset.server.js";
 import { bricksetBarcodes, describeBarcodes } from "./barcodes.js";
+import { describeStocking } from "./inventory-locations.js";
 import {
   CONSTRUCTION_TOYS_CATEGORY_ID,
   attachImages,
   checkProductExists,
   createProduct,
   enableInventoryTracking,
+  getActiveLocations,
   getAvailableChannels,
   getFirstVariant,
   publishToChannels,
   setVariantSku,
+  stockAtAllLocations,
   updateVariantFields,
 } from "./shopify-product.server.js";
 
@@ -82,6 +85,9 @@ export async function importSets(auth, ids, env) {
   let importedCount = 0;
 
   const availableChannels = await getAvailableChannels(admin);
+  // Every active location, read once per run: each new product is stocked at
+  // all of them at zero so the POS never asks "stock at this location?".
+  const locations = await getActiveLocations(admin);
 
   for (const rawId of ids) {
     const setNum = String(rawId || "").trim();
@@ -165,8 +171,16 @@ export async function importSets(auth, ids, env) {
         label: setNum,
       });
 
+      // Track inventory, then stock the item at every active location at
+      // zero. A stocking failure is reported on this row, never fatal.
+      let stocking = { ok: false, activated: [], alreadyActive: [], message: "variant has no inventory item" };
       if (variant.inventoryItemId) {
         await enableInventoryTracking(admin, { productId, variantId: variant.variantId, label: setNum });
+        stocking = await stockAtAllLocations(admin, {
+          inventoryItemId: variant.inventoryItemId,
+          locations,
+          label: setNum,
+        });
       }
 
       await setVariantSku(session, { variantId: variant.variantId, sku: cleanSetNum, label: setNum });
@@ -186,18 +200,23 @@ export async function importSets(auth, ids, env) {
       const barcodeNote = barcodes.length
         ? `barcodes ${describeBarcodes(barcodes)}`
         : "no barcode in Brickset";
+      const stockingNote = stocking.ok
+        ? describeStocking(stocking)
+        : `NOT stocked at every location (${stocking.message})`;
 
       results.push({
         id: setNum,
         status: "created",
         errorCode: null,
-        message: `${productTitle} (${setNum}): ${attachedCount} images, ${barcodeNote}`,
+        message: `${productTitle} (${setNum}): ${attachedCount} images, ${barcodeNote}, ${stockingNote}`,
         shopifyProductTitle: productTitle,
         shopifyProductId: productId,
         imageCount: attachedCount,
         ean: set.ean || null,
         upc: set.upc || null,
         barcodes,
+        stockedAt: stocking.activated.concat(stocking.alreadyActive).map((l) => l.name),
+        stockingError: stocking.ok ? null : stocking.message,
       });
     } catch (err) {
       console.error(`[${setNum}] Import failed:`, err?.message || "Unknown error");
