@@ -79,7 +79,7 @@ export function buildSetProductInput(set, cleanSetNum, env = {}) {
  * @param {Object} env - process.env
  */
 export async function importSets(auth, ids, env) {
-  const { admin, session } = await auth;
+  const { admin } = await auth;
 
   const results = [];
   let importedCount = 0;
@@ -183,7 +183,7 @@ export async function importSets(auth, ids, env) {
         });
       }
 
-      await setVariantSku(session, { variantId: variant.variantId, sku: cleanSetNum, label: setNum });
+      await setVariantSku(admin, { productId, variantId: variant.variantId, sku: cleanSetNum, label: setNum });
 
       await publishToChannels(admin, { productId, channelIds: availableChannels, label: setNum });
 

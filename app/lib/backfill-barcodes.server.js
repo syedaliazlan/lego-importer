@@ -129,7 +129,9 @@ export function classifyVariant(variant, parsed, barcodeMap) {
 //     "returns the first entry in `barcodes`" when there is more than one.
 //   https://shopify.dev/docs/api/admin-graphql/2026-10/objects/ProductVariant
 //   https://shopify.dev/docs/api/admin-graphql/2026-10/connections/ProductVariantBarcodeConnection
-// The legacy `barcode` is still read as a safety net (see mergeBarcodes).
+// The deprecated `barcode` is no longer queried (10 Oct 2026): it only ever
+// returned the first entry of `barcodes`, which is read in full, so the legacy
+// argument to mergeBarcodes is now always empty.
 const PRODUCT_VARIANTS_QUERY = `
   query BackfillVariants($first: Int!, $after: String) {
     productVariants(first: $first, after: $after) {
@@ -137,7 +139,6 @@ const PRODUCT_VARIANTS_QUERY = `
         node {
           id
           sku
-          barcode
           barcodes(first: 20) {
             nodes { value type }
           }

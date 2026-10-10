@@ -109,8 +109,8 @@ export function pickVariantForSetNumber(setNumber, variants) {
    SHOPIFY I/O
 =============================================================== */
 
-// Same selection as the backfill's page query so existingBarcodes() and the
-// legacy `barcode` safety net behave identically here.
+// Same selection as the backfill's page query, so existingBarcodes() behaves
+// identically here.
 //   https://shopify.dev/docs/api/admin-graphql/2026-10/queries/productVariants
 //   https://shopify.dev/docs/api/admin-graphql/2026-10/objects/ProductVariant
 const VARIANTS_BY_SKU_QUERY = `
@@ -120,7 +120,6 @@ const VARIANTS_BY_SKU_QUERY = `
         node {
           id
           sku
-          barcode
           barcodes(first: 20) {
             nodes { value type }
           }

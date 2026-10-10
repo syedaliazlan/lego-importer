@@ -148,7 +148,7 @@ export async function minifigImageExists(url) {
  * @param {Object} env - process.env
  */
 export async function importMinifigs(auth, ids, env) {
-  const { admin, session } = await auth;
+  const { admin } = await auth;
 
   const requested = (ids || []).map((raw) => {
     const trimmed = String(raw || "").trim();
@@ -276,7 +276,7 @@ export async function importMinifigs(auth, ids, env) {
         });
       }
 
-      await setVariantSku(session, { variantId: variant.variantId, sku: minifig.sku, label: minifig.sku });
+      await setVariantSku(admin, { productId, variantId: variant.variantId, sku: minifig.sku, label: minifig.sku });
 
       await publishToChannels(admin, { productId, channelIds: availableChannels, label: minifig.sku });
 

@@ -81,7 +81,7 @@ export async function getAvailableChannels(admin) {
   const query = `
     query {
       publications(first: 50) {
-        edges { node { id name } }
+        edges { node { id } }
       }
     }
   `;
@@ -119,16 +119,20 @@ function isMissingMetafieldDefinition(error) {
  * @returns {Promise<{ok: true, productId: string, title: string} | {ok: false, errorCode: string, message: string}>}
  */
 export async function createProduct(admin, productInput, label = "") {
+  // `product: ProductCreateInput` replaces the deprecated `input: ProductInput`
+  // (2026-10). The fields the importer sends exist on both; the ones only on
+  // ProductInput (publications, published, publishDate and so on) are not used.
+  //   https://shopify.dev/docs/api/admin-graphql/2026-10/mutations/productCreate
   const mutation = `
-    mutation CreateProduct($input: ProductInput!) {
-      productCreate(input: $input) {
+    mutation CreateProduct($product: ProductCreateInput!) {
+      productCreate(product: $product) {
         product { id title status publishedAt }
         userErrors { field message }
       }
     }
   `;
 
-  const resp = await admin.graphql(mutation, { variables: { input: productInput } });
+  const resp = await admin.graphql(mutation, { variables: { product: productInput } });
   const json = await resp.json();
 
   if (json.errors) {
@@ -492,42 +496,29 @@ export async function stockAtAllLocations(admin, { inventoryItemId, locations, l
 
 /**
  * Write the variant SKU.
- * GraphQL will not set a SKU on the auto-created default variant, so this
- * goes through the REST admin API.
+ *
+ * The SKU lives on the inventory item, so it is written through
+ * ProductVariantsBulkInput.inventoryItem.sku (InventoryItemInput.sku), the
+ * same productVariantsBulkUpdate call used for tracking above. This replaced a
+ * REST PUT /admin/api/2025-10/variants/{id}.json when the app moved to 2026-10:
+ * the REST call was pinned to a version about to leave support, and REST
+ * product endpoints are legacy.
+ *   https://shopify.dev/docs/api/admin-graphql/2026-10/input-objects/InventoryItemInput
  * @returns {Promise<boolean>} whether the SKU now matches
  */
-export async function setVariantSku(session, { variantId, sku, label = "" }) {
-  if (!session?.shop) {
-    console.error(`[${label}] Cannot set SKU: session.shop not available`);
+export async function setVariantSku(admin, { productId, variantId, sku, label = "" }) {
+  const variant = await bulkUpdateVariant(
+    admin,
+    productId,
+    { id: variantId, inventoryItem: { sku } },
+    label,
+    "SKU update"
+  );
+  if (variant?.sku !== sku) {
+    console.error(`[${label}] SKU not set. Expected: ${sku}, Got: ${variant?.sku || "null"}`);
     return false;
   }
-
-  try {
-    const variantIdNum = variantId.split("/").pop();
-    const resp = await fetch(`https://${session.shop}/admin/api/2025-10/variants/${variantIdNum}.json`, {
-      method: "PUT",
-      headers: {
-        "X-Shopify-Access-Token": session.accessToken,
-        "Content-Type": "application/json",
-      },
-      body: JSON.stringify({ variant: { sku } }),
-    });
-
-    if (!resp.ok) {
-      console.error(`[${label}] Failed to set SKU: ${resp.status} ${await resp.text()}`);
-      return false;
-    }
-
-    const json = await resp.json();
-    if (json.variant?.sku !== sku) {
-      console.error(`[${label}] SKU not set. Expected: ${sku}, Got: ${json.variant?.sku || "null"}`);
-      return false;
-    }
-    return true;
-  } catch (err) {
-    console.error(`[${label}] Error setting SKU:`, err.message);
-    return false;
-  }
+  return true;
 }
 
 /* ===============================================================
@@ -583,12 +574,15 @@ export async function publishToChannels(admin, { productId, channelIds, label = 
 export async function attachImages(admin, { productId, title, imageUrls, label = "" }) {
   if (!Array.isArray(imageUrls) || imageUrls.length === 0) return 0;
 
+  // productUpdate(media:) replaces the deprecated productCreateMedia (2026-10).
+  // Its payload has no media list or mediaUserErrors, so the accepted count is
+  // read back from the product, matched on the alt text set here.
+  //   https://shopify.dev/docs/api/admin-graphql/2026-10/mutations/productUpdate
   const mutation = `
-    mutation productCreateMedia($media: [CreateMediaInput!]!, $productId: ID!) {
-      productCreateMedia(media: $media, productId: $productId) {
-        media { alt mediaContentType status }
-        mediaUserErrors { field message }
-        product { id title }
+    mutation AttachImages($product: ProductUpdateInput!, $media: [CreateMediaInput!]) {
+      productUpdate(product: $product, media: $media) {
+        product { id media(first: 50) { nodes { alt mediaContentType status } } }
+        userErrors { field message }
       }
     }
   `;
@@ -600,19 +594,21 @@ export async function attachImages(admin, { productId, title, imageUrls, label =
   }));
 
   try {
-    const resp = await admin.graphql(mutation, { variables: { media, productId } });
+    const resp = await admin.graphql(mutation, { variables: { product: { id: productId }, media } });
     const json = await resp.json();
 
     if (json.errors) {
       console.error(`[${label}] Image attachment GraphQL error:`, json.errors[0]?.message || "Unknown error");
     }
 
-    const mediaErrors = json.data?.productCreateMedia?.mediaUserErrors || [];
+    const mediaErrors = json.data?.productUpdate?.userErrors || [];
     if (mediaErrors.length) {
       console.warn(`[${label}] Image attachment errors:`, mediaErrors.map((e) => e.message).join("; "));
     }
 
-    return json.data?.productCreateMedia?.media?.length || 0;
+    const ourAlts = new Set(media.map((m) => m.alt));
+    const nodes = json.data?.productUpdate?.product?.media?.nodes || [];
+    return nodes.filter((n) => ourAlts.has(n.alt)).length;
   } catch (err) {
     console.error(`[${label}] Failed to attach images:`, err.message);
     return 0;
