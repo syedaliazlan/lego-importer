@@ -13,7 +13,7 @@
 // scannable at the till from a printed label.
 
 import { fetchMinifigs, normalizeMinifigId } from "./brickset.server.js";
-import { describeStocking } from "./inventory-locations.js";
+import { describeStocking, stockedAtLabels } from "./inventory-locations.js";
 import {
   ACTION_FIGURES_CATEGORY_ID,
   attachImages,
@@ -307,7 +307,7 @@ export async function importMinifigs(auth, ids, env) {
         shopifyProductId: productId,
         imageCount: attachedCount,
         barcode: minifig.sku,
-        stockedAt: stocking.activated.concat(stocking.alreadyActive).map((l) => l.name),
+        stockedAt: stockedAtLabels(stocking),
         stockingError: stocking.ok ? null : stocking.message,
       });
     } catch (err) {

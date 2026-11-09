@@ -81,13 +81,60 @@ export function nonZeroAvailable(inventoryLevels) {
   return out;
 }
 
+// Location names need the read_locations scope, which this app does not
+// have (the store answers "Access denied for name field"), so locations
+// normally arrive with the id standing in for the name. A real name is one
+// that is set and is not just the id.
+function hasRealName(loc) {
+  const name = String(loc?.name ?? "").trim();
+  return name !== "" && name !== loc?.id;
+}
+
+function locationsWord(n) {
+  return n === 1 ? "1 location" : `${n} locations`;
+}
+
+/**
+ * Short label for one location: its name when known, otherwise
+ * "location 115809452407" (the numeric part of the gid).
+ * @param {{id?: string, name?: string}} loc
+ */
+export function locationLabel(loc) {
+  if (hasRealName(loc)) return String(loc.name).trim();
+  const numeric = String(loc?.id ?? "").split("/").pop();
+  return numeric ? `location ${numeric}` : "unknown location";
+}
+
+/**
+ * What the result row shows after "Stocked at": the location names when every
+ * one is known, otherwise a count, e.g. ["all 3 locations"].
+ * @param {{activated?: Array<{id: string, name?: string}>, alreadyActive?: Array<{id: string, name?: string}>}} r
+ * @returns {string[]}
+ */
+export function stockedAtLabels(r = {}) {
+  const all = [...(r.activated || []), ...(r.alreadyActive || [])];
+  if (!all.length) return [];
+  if (all.every(hasRealName)) return all.map((l) => String(l.name).trim());
+  return [all.length === 1 ? "1 location" : `all ${all.length} locations`];
+}
+
 /**
  * One line for the import result row, e.g.
  *   "stocked at 2 locations (Aylesbury, Warehouse)"
  *   "already stocked at Aylesbury; stocked at Warehouse"
- * @param {{activated?: Array<{name: string}>, alreadyActive?: Array<{name: string}>}} r
+ * or, when the location names are not readable:
+ *   "stocked at all 3 locations (2 added)"
+ * @param {{activated?: Array<{id?: string, name: string}>, alreadyActive?: Array<{id?: string, name: string}>}} r
  */
 export function describeStocking(r = {}) {
+  const all = [...(r.activated || []), ...(r.alreadyActive || [])];
+  if (all.length && !all.every(hasRealName)) {
+    const added = (r.activated || []).length;
+    const total = all.length;
+    const where = total === 1 ? "1 location" : `all ${total} locations`;
+    return added ? `stocked at ${where} (${added} added)` : `already stocked at ${where}`;
+  }
+
   const activated = (r.activated || []).map((l) => l.name);
   const already = (r.alreadyActive || []).map((l) => l.name);
   const parts = [];
@@ -96,7 +143,7 @@ export function describeStocking(r = {}) {
     parts.push(
       activated.length === 1
         ? `stocked at ${activated[0]}`
-        : `stocked at ${activated.length} locations (${activated.join(", ")})`
+        : `stocked at ${locationsWord(activated.length)} (${activated.join(", ")})`
     );
   }
   return parts.join("; ") || "no locations";

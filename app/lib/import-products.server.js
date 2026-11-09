@@ -2,7 +2,7 @@
 
 import { fetchSet } from "./brickset.server.js";
 import { bricksetBarcodes, describeBarcodes } from "./barcodes.js";
-import { describeStocking } from "./inventory-locations.js";
+import { describeStocking, stockedAtLabels } from "./inventory-locations.js";
 import {
   CONSTRUCTION_TOYS_CATEGORY_ID,
   attachImages,
@@ -215,7 +215,7 @@ export async function importSets(auth, ids, env) {
         ean: set.ean || null,
         upc: set.upc || null,
         barcodes,
-        stockedAt: stocking.activated.concat(stocking.alreadyActive).map((l) => l.name),
+        stockedAt: stockedAtLabels(stocking),
         stockingError: stocking.ok ? null : stocking.message,
       });
     } catch (err) {

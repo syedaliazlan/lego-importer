@@ -16,6 +16,7 @@
 import {
   activationUpdates,
   activeLocationIdsFromLevels,
+  locationLabel,
   locationsToActivate,
   nonZeroAvailable,
 } from "./inventory-locations.js";
@@ -318,18 +319,27 @@ export async function enableInventoryTracking(admin, { productId, variantId, lab
 // product should be stocked at. Read on shopify.dev for 2026-10 (2026-09-14):
 //   https://shopify.dev/docs/api/admin-graphql/2026-10/queries/locations
 //   https://shopify.dev/docs/api/admin-graphql/2026-10/objects/Location
-// Requires read_inventory (implied by write_inventory) or read_locations.
-const LOCATIONS_QUERY = `
+//
+// Ids ONLY. Location `name` needs the read_locations scope, which this app
+// does not have. Asking for it fails the WHOLE query; observed on the live
+// store 2026-11-09 with this app's own token:
+//   "Access denied for name field. Required access: `read_locations` access
+//    scope or `read_markets_home` access scope."
+// That error made this function return [] on every run, so no imported
+// product was stocked anywhere beyond the location Shopify created it at.
+// The same query without `name` returns all three locations.
+export const LOCATIONS_QUERY = `
   query ImportLocations {
     locations(first: 50) {
-      edges { node { id name } }
+      edges { node { id } }
     }
   }
 `;
 
 /**
- * Every active location on the shop. Fetched ONCE per import run and passed
- * to stockAtAllLocations for each product.
+ * Every active location on the shop, as ids. Fetched ONCE per import run and
+ * passed to stockAtAllLocations for each product. Names are not readable
+ * (see LOCATIONS_QUERY), so the result rows describe locations by count.
  * Returns [] on failure so the import carries on; the missing stocking is
  * then reported on every product row.
  * @returns {Promise<Array<{id: string, name: string}>>}
@@ -345,7 +355,7 @@ export async function getActiveLocations(admin) {
     return (json.data?.locations?.edges || [])
       .map((e) => e?.node)
       .filter((n) => n?.id)
-      .map((n) => ({ id: n.id, name: n.name || n.id }));
+      .map((n) => ({ id: n.id, name: n.id }));
   } catch (err) {
     console.warn("Could not fetch locations, continuing without them:", err?.message);
     return [];
@@ -391,13 +401,14 @@ const INVENTORY_ITEM_LEVELS_QUERY = `
 // inventoryLevels are read back with quantities(names: ["available"]) so a
 // non-zero level would be reported rather than assumed. Both require
 // write_inventory, which the app already has in shopify.app.toml.
-const INVENTORY_BULK_TOGGLE_ACTIVATION = `
+// `location { id }` only: `name` needs read_locations (see LOCATIONS_QUERY).
+export const INVENTORY_BULK_TOGGLE_ACTIVATION = `
   mutation ImportStockAtLocations($inventoryItemId: ID!, $inventoryItemUpdates: [InventoryBulkToggleActivationInput!]!) {
     inventoryBulkToggleActivation(inventoryItemId: $inventoryItemId, inventoryItemUpdates: $inventoryItemUpdates) {
       inventoryItem { id }
       inventoryLevels {
         id
-        location { id name }
+        location { id }
         quantities(names: ["available"]) { name quantity }
       }
       userErrors { field message code }
@@ -478,7 +489,7 @@ export async function stockAtAllLocations(admin, { inventoryItemId, locations, l
     result.nonZero = nonZeroAvailable(payload?.inventoryLevels);
 
     if (missed.length) {
-      result.message = `not activated at ${missed.map((l) => l.name).join(", ")}`;
+      result.message = `not activated at ${missed.map(locationLabel).join(", ")}`;
       console.error(`[${label}] ${result.message}`);
       return result;
     }

@@ -12,8 +12,10 @@ import {
   activationUpdates,
   activeLocationIdsFromLevels,
   describeStocking,
+  locationLabel,
   locationsToActivate,
   nonZeroAvailable,
+  stockedAtLabels,
 } from "./inventory-locations.js";
 
 const AYLESBURY = { id: "gid://shopify/Location/1", name: "Aylesbury" };
@@ -93,4 +95,35 @@ test("describeStocking: readable one-liner for the result row", () => {
     "already stocked at Warehouse; stocked at 2 locations (Aylesbury, Online)"
   );
   assert.equal(describeStocking({}), "no locations");
+});
+
+// The shape getActiveLocations really produces on this store: no
+// read_locations scope, so the id stands in for the name. Ids are the store's
+// three real location ids.
+const AYL_ID = { id: "gid://shopify/Location/115870531959", name: "gid://shopify/Location/115870531959" };
+const GLA_ID = { id: "gid://shopify/Location/115809452407", name: "gid://shopify/Location/115809452407" };
+const WEB_ID = { id: "gid://shopify/Location/106650468727", name: "gid://shopify/Location/106650468727" };
+
+test("describeStocking: locations without names are described by count, never by gid", () => {
+  assert.equal(
+    describeStocking({ activated: [AYL_ID, GLA_ID], alreadyActive: [WEB_ID] }),
+    "stocked at all 3 locations (2 added)"
+  );
+  assert.equal(describeStocking({ alreadyActive: [AYL_ID, GLA_ID, WEB_ID] }), "already stocked at all 3 locations");
+  assert.equal(describeStocking({ activated: [GLA_ID] }), "stocked at 1 location (1 added)");
+  assert.doesNotMatch(describeStocking({ activated: [AYL_ID, GLA_ID], alreadyActive: [WEB_ID] }), /gid:/);
+});
+
+test("stockedAtLabels: names when known, a count when not, empty when nothing", () => {
+  assert.deepEqual(stockedAtLabels({ activated: [AYLESBURY], alreadyActive: [WAREHOUSE] }), ["Aylesbury", "Warehouse"]);
+  assert.deepEqual(stockedAtLabels({ activated: [AYL_ID, GLA_ID], alreadyActive: [WEB_ID] }), ["all 3 locations"]);
+  assert.deepEqual(stockedAtLabels({ activated: [AYLESBURY], alreadyActive: [WEB_ID] }), ["all 2 locations"]);
+  assert.deepEqual(stockedAtLabels({}), []);
+});
+
+test("locationLabel: name when known, numeric id when not", () => {
+  assert.equal(locationLabel(AYLESBURY), "Aylesbury");
+  assert.equal(locationLabel(GLA_ID), "location 115809452407");
+  assert.equal(locationLabel({ id: "gid://shopify/Location/7", name: "  " }), "location 7");
+  assert.equal(locationLabel({}), "unknown location");
 });
