@@ -19,14 +19,12 @@ import {
   attachImages,
   checkProductExists,
   createProduct,
-  enableInventoryTracking,
+  describeClientError,
   getActiveLocations,
   getAvailableChannels,
-  getFirstVariant,
+  leftoverDraftMessage,
   publishToChannels,
-  setVariantSku,
-  stockAtAllLocations,
-  updateVariantFields,
+  setUpNewVariant,
 } from "./shopify-product.server.js";
 
 /* ===============================================================
@@ -213,6 +211,10 @@ export async function importMinifigs(auth, ids, env) {
       continue;
     }
 
+    // Set once the product exists, so a failure after that point can name
+    // the draft it left behind.
+    let createdProduct = null;
+
     try {
       console.log(`[${minifig.sku}] Starting import...`);
 
@@ -240,43 +242,34 @@ export async function importMinifigs(auth, ids, env) {
       }
 
       const { productId, title: productTitle } = created;
+      createdProduct = { productId, title: productTitle };
       console.log(`[${minifig.sku}] Product created: ${productTitle}`);
-
-      const variant = await getFirstVariant(admin, productId, minifig.sku);
-      if (!variant.ok) {
-        results.push({
-          id: raw,
-          status: "error",
-          errorCode: variant.errorCode,
-          message: variant.message,
-          shopifyProductId: productId,
-        });
-        continue;
-      }
 
       // No EAN exists for a minifigure, so the catalogue ID becomes the
       // barcode. It is not a GS1 code, so it is written with no type
       // ("Custom" in the admin), which Shopify stores as entered.
-      await updateVariantFields(admin, {
+      // Then SKU, tracking, and stock at every active location at zero. The
+      // SKU goes on before stocking (see setUpNewVariant). A SKU, tracking or
+      // stocking failure is reported on this row, never fatal.
+      const setup = await setUpNewVariant(admin, {
         productId,
-        variantId: variant.variantId,
+        sku: minifig.sku,
         barcodes: [{ value: minifig.sku, type: null }],
+        locations,
         label: minifig.sku,
       });
-
-      // Track inventory, then stock the item at every active location at
-      // zero. A stocking failure is reported on this row, never fatal.
-      let stocking = { ok: false, activated: [], alreadyActive: [], message: "variant has no inventory item" };
-      if (variant.inventoryItemId) {
-        await enableInventoryTracking(admin, { productId, variantId: variant.variantId, label: minifig.sku });
-        stocking = await stockAtAllLocations(admin, {
-          inventoryItemId: variant.inventoryItemId,
-          locations,
-          label: minifig.sku,
+      if (!setup.ok) {
+        results.push({
+          id: raw,
+          status: "error",
+          errorCode: setup.errorCode,
+          message: leftoverDraftMessage({ title: productTitle, productId, importId: raw, reason: setup.message }),
+          shopifyProductId: productId,
+          shopifyProductTitle: productTitle,
         });
+        continue;
       }
-
-      await setVariantSku(admin, { productId, variantId: variant.variantId, sku: minifig.sku, label: minifig.sku });
+      const { stocking, warnings } = setup;
 
       await publishToChannels(admin, { productId, channelIds: availableChannels, label: minifig.sku });
 
@@ -298,22 +291,41 @@ export async function importMinifigs(auth, ids, env) {
         ? describeStocking(stocking)
         : `NOT stocked at every location (${stocking.message})`;
 
+      const warningNote = warnings.length ? `, ${warnings.join(", ")}` : "";
+
       results.push({
         id: raw,
         status: "created",
         errorCode: null,
-        message: `${productTitle} (${minifig.sku}): ${imageNote}, barcode ${minifig.sku}, ${stockingNote}`,
+        message: `${productTitle} (${minifig.sku}): ${imageNote}, barcode ${minifig.sku}, ${stockingNote}${warningNote}`,
         shopifyProductTitle: productTitle,
         shopifyProductId: productId,
         imageCount: attachedCount,
         barcode: minifig.sku,
         stockedAt: stockedAtLabels(stocking),
         stockingError: stocking.ok ? null : stocking.message,
+        warnings,
       });
     } catch (err) {
-      const errorMessage = err?.message || "Unknown error";
+      const errorMessage = describeClientError(err);
       console.error(`[${minifig.sku}] Import failed:`, errorMessage);
-      results.push({ id: raw, status: "error", errorCode: "UNKNOWN_ERROR", message: errorMessage });
+      if (createdProduct) {
+        results.push({
+          id: raw,
+          status: "error",
+          errorCode: "IMPORT_STOPPED_AFTER_CREATE",
+          message: leftoverDraftMessage({
+            title: createdProduct.title,
+            productId: createdProduct.productId,
+            importId: raw,
+            reason: `the import stopped part way (${errorMessage})`,
+          }),
+          shopifyProductId: createdProduct.productId,
+          shopifyProductTitle: createdProduct.title,
+        });
+      } else {
+        results.push({ id: raw, status: "error", errorCode: "UNKNOWN_ERROR", message: errorMessage });
+      }
     }
   }
 

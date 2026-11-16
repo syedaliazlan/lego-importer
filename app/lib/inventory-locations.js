@@ -82,9 +82,29 @@ export function nonZeroAvailable(inventoryLevels) {
 }
 
 // Location names need the read_locations scope, which this app does not
-// have (the store answers "Access denied for name field"), so locations
-// normally arrive with the id standing in for the name. A real name is one
-// that is set and is not just the id.
+// have (the live store answers "Access denied for name field"), so the app
+// cannot ask Shopify for them. These are the store's three locations by id
+// (ids confirmed live 2026-11-16 with the app's own token). Any other
+// location is shown by its numeric id.
+export const KNOWN_LOCATION_NAMES = Object.freeze({
+  "gid://shopify/Location/115870531959": "Aylesbury",
+  "gid://shopify/Location/115809452407": "Glasgow",
+  "gid://shopify/Location/106650468727": "warehouse",
+});
+
+/**
+ * Name for a location id: the known name, otherwise "location 115809452407"
+ * (the numeric part of the gid).
+ * @param {string} id
+ */
+export function locationName(id) {
+  const known = KNOWN_LOCATION_NAMES[id];
+  if (known) return known;
+  const numeric = String(id ?? "").split("/").pop();
+  return numeric ? `location ${numeric}` : "unknown location";
+}
+
+// A real name is one that is set and is not just the id standing in for it.
 function hasRealName(loc) {
   const name = String(loc?.name ?? "").trim();
   return name !== "" && name !== loc?.id;
@@ -95,48 +115,33 @@ function locationsWord(n) {
 }
 
 /**
- * Short label for one location: its name when known, otherwise
- * "location 115809452407" (the numeric part of the gid).
+ * Short label for one location: its name when set, otherwise the known name
+ * for its id, otherwise "location 115809452407".
  * @param {{id?: string, name?: string}} loc
  */
 export function locationLabel(loc) {
   if (hasRealName(loc)) return String(loc.name).trim();
-  const numeric = String(loc?.id ?? "").split("/").pop();
-  return numeric ? `location ${numeric}` : "unknown location";
+  return locationName(loc?.id);
 }
 
 /**
- * What the result row shows after "Stocked at": the location names when every
- * one is known, otherwise a count, e.g. ["all 3 locations"].
+ * What the result row shows after "Stocked at", e.g.
+ * ["Aylesbury", "Glasgow", "warehouse"].
  * @param {{activated?: Array<{id: string, name?: string}>, alreadyActive?: Array<{id: string, name?: string}>}} r
  * @returns {string[]}
  */
 export function stockedAtLabels(r = {}) {
-  const all = [...(r.activated || []), ...(r.alreadyActive || [])];
-  if (!all.length) return [];
-  if (all.every(hasRealName)) return all.map((l) => String(l.name).trim());
-  return [all.length === 1 ? "1 location" : `all ${all.length} locations`];
+  return [...(r.activated || []), ...(r.alreadyActive || [])].map(locationLabel);
 }
 
 /**
  * One line for the import result row, e.g.
- *   "stocked at 2 locations (Aylesbury, Warehouse)"
- *   "already stocked at Aylesbury; stocked at Warehouse"
- * or, when the location names are not readable:
- *   "stocked at all 3 locations (2 added)"
- * @param {{activated?: Array<{id?: string, name: string}>, alreadyActive?: Array<{id?: string, name: string}>}} r
+ *   "already stocked at warehouse; stocked at 2 locations (Aylesbury, Glasgow)"
+ * @param {{activated?: Array<{id?: string, name?: string}>, alreadyActive?: Array<{id?: string, name?: string}>}} r
  */
 export function describeStocking(r = {}) {
-  const all = [...(r.activated || []), ...(r.alreadyActive || [])];
-  if (all.length && !all.every(hasRealName)) {
-    const added = (r.activated || []).length;
-    const total = all.length;
-    const where = total === 1 ? "1 location" : `all ${total} locations`;
-    return added ? `stocked at ${where} (${added} added)` : `already stocked at ${where}`;
-  }
-
-  const activated = (r.activated || []).map((l) => l.name);
-  const already = (r.alreadyActive || []).map((l) => l.name);
+  const activated = (r.activated || []).map(locationLabel);
+  const already = (r.alreadyActive || []).map(locationLabel);
   const parts = [];
   if (already.length) parts.push(`already stocked at ${already.join(", ")}`);
   if (activated.length) {
@@ -147,4 +152,19 @@ export function describeStocking(r = {}) {
     );
   }
   return parts.join("; ") || "no locations";
+}
+
+/**
+ * The row text when the item is not stocked everywhere: which locations it IS
+ * stocked at, which it is NOT, and what Shopify said, e.g.
+ *   "stocked at warehouse, Aylesbury; NOT stocked at Glasgow (Shopify said: ...)"
+ * @param {{activated?: Array<object>, alreadyActive?: Array<object>, failed?: Array<object>, problem?: string|null}} r
+ */
+export function describeStockingFailure({ activated = [], alreadyActive = [], failed = [], problem = null } = {}) {
+  const stocked = [...alreadyActive, ...activated].map(locationLabel);
+  const missing = failed.map(locationLabel);
+  const parts = [stocked.length ? `stocked at ${stocked.join(", ")}` : "not stocked at any location"];
+  if (missing.length) parts.push(`NOT stocked at ${missing.join(", ")}`);
+  const text = parts.join("; ");
+  return problem ? `${text} (Shopify said: ${problem})` : text;
 }

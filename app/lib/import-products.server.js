@@ -8,14 +8,12 @@ import {
   attachImages,
   checkProductExists,
   createProduct,
-  enableInventoryTracking,
+  describeClientError,
   getActiveLocations,
   getAvailableChannels,
-  getFirstVariant,
+  leftoverDraftMessage,
   publishToChannels,
-  setVariantSku,
-  stockAtAllLocations,
-  updateVariantFields,
+  setUpNewVariant,
 } from "./shopify-product.server.js";
 
 /**
@@ -101,6 +99,10 @@ export async function importSets(auth, ids, env) {
       continue;
     }
 
+    // Set once the product exists, so a failure after that point can name
+    // the draft it left behind.
+    let createdProduct = null;
+
     try {
       console.log(`[${setNum}] Starting import...`);
 
@@ -145,45 +147,37 @@ export async function importSets(auth, ids, env) {
       }
 
       const { productId, title: productTitle } = created;
+      createdProduct = { productId, title: productTitle };
       console.log(`[${setNum}] Product created: ${productTitle}`);
-
-      const variant = await getFirstVariant(admin, productId, setNum);
-      if (!variant.ok) {
-        results.push({
-          id: setNum,
-          status: "error",
-          errorCode: variant.errorCode,
-          message: variant.message,
-          shopifyProductId: productId,
-        });
-        continue;
-      }
 
       // Every barcode Brickset knows goes onto the variant with its type
       // (EAN for UK/EU boxes, UPC for North American boxes) so the set scans
       // at Shopify POS whichever box is on the counter. Left empty when
       // Brickset has neither, which the result message below flags.
       const barcodes = bricksetBarcodes({ ean: set.ean, upc: set.upc });
-      await updateVariantFields(admin, {
+
+      // Barcodes, SKU, tracking, then stock at every active location at zero.
+      // The SKU goes on before stocking (see setUpNewVariant). A SKU, tracking
+      // or stocking failure is reported on this row, never fatal.
+      const setup = await setUpNewVariant(admin, {
         productId,
-        variantId: variant.variantId,
+        sku: cleanSetNum,
         barcodes,
+        locations,
         label: setNum,
       });
-
-      // Track inventory, then stock the item at every active location at
-      // zero. A stocking failure is reported on this row, never fatal.
-      let stocking = { ok: false, activated: [], alreadyActive: [], message: "variant has no inventory item" };
-      if (variant.inventoryItemId) {
-        await enableInventoryTracking(admin, { productId, variantId: variant.variantId, label: setNum });
-        stocking = await stockAtAllLocations(admin, {
-          inventoryItemId: variant.inventoryItemId,
-          locations,
-          label: setNum,
+      if (!setup.ok) {
+        results.push({
+          id: setNum,
+          status: "error",
+          errorCode: setup.errorCode,
+          message: leftoverDraftMessage({ title: productTitle, productId, importId: setNum, reason: setup.message }),
+          shopifyProductId: productId,
+          shopifyProductTitle: productTitle,
         });
+        continue;
       }
-
-      await setVariantSku(admin, { productId, variantId: variant.variantId, sku: cleanSetNum, label: setNum });
+      const { stocking, warnings } = setup;
 
       await publishToChannels(admin, { productId, channelIds: availableChannels, label: setNum });
 
@@ -204,11 +198,13 @@ export async function importSets(auth, ids, env) {
         ? describeStocking(stocking)
         : `NOT stocked at every location (${stocking.message})`;
 
+      const warningNote = warnings.length ? `, ${warnings.join(", ")}` : "";
+
       results.push({
         id: setNum,
         status: "created",
         errorCode: null,
-        message: `${productTitle} (${setNum}): ${attachedCount} images, ${barcodeNote}, ${stockingNote}`,
+        message: `${productTitle} (${setNum}): ${attachedCount} images, ${barcodeNote}, ${stockingNote}${warningNote}`,
         shopifyProductTitle: productTitle,
         shopifyProductId: productId,
         imageCount: attachedCount,
@@ -217,11 +213,29 @@ export async function importSets(auth, ids, env) {
         barcodes,
         stockedAt: stockedAtLabels(stocking),
         stockingError: stocking.ok ? null : stocking.message,
+        warnings,
       });
     } catch (err) {
-      console.error(`[${setNum}] Import failed:`, err?.message || "Unknown error");
+      const errorMessage = describeClientError(err);
+      console.error(`[${setNum}] Import failed:`, errorMessage);
 
-      const errorMessage = err?.message || "Unknown error";
+      if (createdProduct) {
+        results.push({
+          id: setNum,
+          status: "error",
+          errorCode: "IMPORT_STOPPED_AFTER_CREATE",
+          message: leftoverDraftMessage({
+            title: createdProduct.title,
+            productId: createdProduct.productId,
+            importId: setNum,
+            reason: `the import stopped part way (${errorMessage})`,
+          }),
+          shopifyProductId: createdProduct.productId,
+          shopifyProductTitle: createdProduct.title,
+        });
+        continue;
+      }
+
       let errorCode = "UNKNOWN_ERROR";
 
       if (errorMessage.includes("Brickset") || errorMessage.includes("brickset")) {

@@ -405,6 +405,11 @@ export default function LegoImporterIndex() {
                               Stocked at {row.stockedAt.join(", ")} (0 in stock)
                             </div>
                           ) : null}
+                          {row.warnings?.map((warning) => (
+                            <div key={warning} style={{ color: "#8a1f1f", fontSize: 12, marginTop: 2 }}>
+                              {warning}
+                            </div>
+                          ))}
                         </>
                       ) : (
                         row.message || "-"
