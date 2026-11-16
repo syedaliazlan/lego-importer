@@ -9,9 +9,11 @@ import {
   checkProductExists,
   createProduct,
   describeClientError,
+  duplicateCheckFailedMessage,
   getActiveLocations,
   getAvailableChannels,
   leftoverDraftMessage,
+  possibleDraftMessage,
   publishToChannels,
   setUpNewVariant,
 } from "./shopify-product.server.js";
@@ -124,6 +126,16 @@ export async function importSets(auth, ids, env) {
       const cleanSetNum = set.set_num_clean || set.set_num.replace(/-1$/, "");
 
       const existingProduct = await checkProductExists(admin, cleanSetNum);
+      if (!existingProduct.checked) {
+        // Fail closed: importing blind could duplicate a product the shop has.
+        results.push({
+          id: setNum,
+          status: "error",
+          errorCode: "DUPLICATE_CHECK_FAILED",
+          message: duplicateCheckFailedMessage({ sku: cleanSetNum, importId: setNum, error: existingProduct.error }),
+        });
+        continue;
+      }
       if (existingProduct.exists) {
         console.log(`[${setNum}] Product already exists with SKU ${cleanSetNum}: ${existingProduct.title}`);
         results.push({
@@ -142,7 +154,14 @@ export async function importSets(auth, ids, env) {
 
       const created = await createProduct(admin, productInput, setNum);
       if (!created.ok) {
-        results.push({ id: setNum, status: "error", errorCode: created.errorCode, message: created.message });
+        results.push({
+          id: setNum,
+          status: "error",
+          errorCode: created.errorCode,
+          message: created.mayExist
+            ? possibleDraftMessage({ title: productInput.title, importId: setNum, reason: created.reason })
+            : created.message,
+        });
         continue;
       }
 
@@ -157,8 +176,8 @@ export async function importSets(auth, ids, env) {
       const barcodes = bricksetBarcodes({ ean: set.ean, upc: set.upc });
 
       // Barcodes, SKU, tracking, then stock at every active location at zero.
-      // The SKU goes on before stocking (see setUpNewVariant). A SKU, tracking
-      // or stocking failure is reported on this row, never fatal.
+      // The SKU goes on before stocking (see setUpNewVariant). A barcode, SKU,
+      // tracking or stocking failure is reported on this row, never fatal.
       const setup = await setUpNewVariant(admin, {
         productId,
         sku: cleanSetNum,
@@ -177,7 +196,7 @@ export async function importSets(auth, ids, env) {
         });
         continue;
       }
-      const { stocking, warnings } = setup;
+      const { stocking, warnings, barcodesWritten } = setup;
 
       await publishToChannels(admin, { productId, channelIds: availableChannels, label: setNum });
 
@@ -191,12 +210,14 @@ export async function importSets(auth, ids, env) {
       importedCount += 1;
 
       // Note which barcodes Brickset supplied so missing ones surface in the UI.
-      const barcodeNote = barcodes.length
-        ? `barcodes ${describeBarcodes(barcodes)}`
-        : "no barcode in Brickset";
+      const barcodeNote = !barcodes.length
+        ? "no barcode in Brickset"
+        : barcodesWritten
+          ? `barcodes ${describeBarcodes(barcodes)}`
+          : `barcodes ${describeBarcodes(barcodes)} NOT written`;
       const stockingNote = stocking.ok
         ? describeStocking(stocking)
-        : `NOT stocked at every location (${stocking.message})`;
+        : `stock locations need checking (${stocking.message})`;
 
       const warningNote = warnings.length ? `, ${warnings.join(", ")}` : "";
 

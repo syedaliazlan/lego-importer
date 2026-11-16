@@ -168,3 +168,22 @@ export function describeStockingFailure({ activated = [], alreadyActive = [], fa
   const text = parts.join("; ");
   return problem ? `${text} (Shopify said: ${problem})` : text;
 }
+
+/**
+ * The row text when the activation's outcome could not be confirmed: its reply
+ * was lost or incomplete AND re-reading the item's locations failed. The
+ * unconfirmed locations may well be stocked, so they are called unknown,
+ * never "NOT stocked", e.g.
+ *   "stocked at warehouse; UNKNOWN at Aylesbury, Glasgow, check them in
+ *    Shopify (Shopify said: fetch failed; re-check failed: Throttled)"
+ * @param {{activated?: Array<object>, alreadyActive?: Array<object>, unknown?: Array<object>, problem?: string|null, recheckError?: string|null}} r
+ */
+export function describeStockingUnknown({ activated = [], alreadyActive = [], unknown = [], problem = null, recheckError = null } = {}) {
+  const stocked = [...alreadyActive, ...activated].map(locationLabel);
+  const parts = [];
+  if (stocked.length) parts.push(`stocked at ${stocked.join(", ")}`);
+  parts.push(`UNKNOWN at ${unknown.map(locationLabel).join(", ")}, check them in Shopify`);
+  const details = [problem && `Shopify said: ${problem}`, recheckError && `re-check failed: ${recheckError}`].filter(Boolean);
+  const text = parts.join("; ");
+  return details.length ? `${text} (${details.join("; ")})` : text;
+}

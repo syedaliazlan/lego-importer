@@ -20,9 +20,11 @@ import {
   checkProductExists,
   createProduct,
   describeClientError,
+  duplicateCheckFailedMessage,
   getActiveLocations,
   getAvailableChannels,
   leftoverDraftMessage,
+  possibleDraftMessage,
   publishToChannels,
   setUpNewVariant,
 } from "./shopify-product.server.js";
@@ -219,6 +221,16 @@ export async function importMinifigs(auth, ids, env) {
       console.log(`[${minifig.sku}] Starting import...`);
 
       const existingProduct = await checkProductExists(admin, minifig.sku);
+      if (!existingProduct.checked) {
+        // Fail closed: importing blind could duplicate a product the shop has.
+        results.push({
+          id: raw,
+          status: "error",
+          errorCode: "DUPLICATE_CHECK_FAILED",
+          message: duplicateCheckFailedMessage({ sku: minifig.sku, importId: raw, error: existingProduct.error }),
+        });
+        continue;
+      }
       if (existingProduct.exists) {
         console.log(`[${minifig.sku}] Product already exists: ${existingProduct.title}`);
         results.push({
@@ -237,7 +249,14 @@ export async function importMinifigs(auth, ids, env) {
 
       const created = await createProduct(admin, productInput, minifig.sku);
       if (!created.ok) {
-        results.push({ id: raw, status: "error", errorCode: created.errorCode, message: created.message });
+        results.push({
+          id: raw,
+          status: "error",
+          errorCode: created.errorCode,
+          message: created.mayExist
+            ? possibleDraftMessage({ title: productInput.title, importId: raw, reason: created.reason })
+            : created.message,
+        });
         continue;
       }
 
@@ -249,8 +268,8 @@ export async function importMinifigs(auth, ids, env) {
       // barcode. It is not a GS1 code, so it is written with no type
       // ("Custom" in the admin), which Shopify stores as entered.
       // Then SKU, tracking, and stock at every active location at zero. The
-      // SKU goes on before stocking (see setUpNewVariant). A SKU, tracking or
-      // stocking failure is reported on this row, never fatal.
+      // SKU goes on before stocking (see setUpNewVariant). A barcode, SKU,
+      // tracking or stocking failure is reported on this row, never fatal.
       const setup = await setUpNewVariant(admin, {
         productId,
         sku: minifig.sku,
@@ -269,7 +288,7 @@ export async function importMinifigs(auth, ids, env) {
         });
         continue;
       }
-      const { stocking, warnings } = setup;
+      const { stocking, warnings, barcodesWritten } = setup;
 
       await publishToChannels(admin, { productId, channelIds: availableChannels, label: minifig.sku });
 
@@ -287,9 +306,10 @@ export async function importMinifigs(auth, ids, env) {
       importedCount += 1;
 
       const imageNote = hasImage ? `${attachedCount} images` : "no image on BrickLink";
+      const barcodeNote = barcodesWritten ? `barcode ${minifig.sku}` : `barcode ${minifig.sku} NOT written`;
       const stockingNote = stocking.ok
         ? describeStocking(stocking)
-        : `NOT stocked at every location (${stocking.message})`;
+        : `stock locations need checking (${stocking.message})`;
 
       const warningNote = warnings.length ? `, ${warnings.join(", ")}` : "";
 
@@ -297,7 +317,7 @@ export async function importMinifigs(auth, ids, env) {
         id: raw,
         status: "created",
         errorCode: null,
-        message: `${productTitle} (${minifig.sku}): ${imageNote}, barcode ${minifig.sku}, ${stockingNote}${warningNote}`,
+        message: `${productTitle} (${minifig.sku}): ${imageNote}, ${barcodeNote}, ${stockingNote}${warningNote}`,
         shopifyProductTitle: productTitle,
         shopifyProductId: productId,
         imageCount: attachedCount,

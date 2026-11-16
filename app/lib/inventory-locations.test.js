@@ -14,6 +14,7 @@ import {
   activeLocationIdsFromLevels,
   describeStocking,
   describeStockingFailure,
+  describeStockingUnknown,
   locationLabel,
   locationName,
   locationsToActivate,
@@ -166,5 +167,24 @@ test("describeStockingFailure: names what took, what did not, and what Shopify s
   assert.equal(
     describeStockingFailure({ failed: [GLA_ID], problem: "Shopify replied HTTP 503" }),
     "not stocked at any location; NOT stocked at Glasgow (Shopify said: Shopify replied HTTP 503)"
+  );
+});
+
+test("describeStockingUnknown: unconfirmed locations are UNKNOWN with a check-in-Shopify note, never NOT stocked", () => {
+  const text = describeStockingUnknown({
+    alreadyActive: [WEB_ID],
+    activated: [AYL_ID],
+    unknown: [GLA_ID, OTHER_ID],
+    problem: "fetch failed",
+    recheckError: "Throttled",
+  });
+  assert.equal(
+    text,
+    "stocked at warehouse, Aylesbury; UNKNOWN at Glasgow, location 42, check them in Shopify (Shopify said: fetch failed; re-check failed: Throttled)"
+  );
+  assert.doesNotMatch(text, /NOT stocked/);
+  assert.equal(
+    describeStockingUnknown({ unknown: [AYL_ID], recheckError: "Throttled" }),
+    "UNKNOWN at Aylesbury, check them in Shopify (re-check failed: Throttled)"
   );
 });

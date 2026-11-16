@@ -397,8 +397,8 @@ export default function LegoImporterIndex() {
                           <span style={{ color: "#999" }}>({row.shopifyProductId})</span>
                           {row.stockingError ? (
                             <div style={{ color: "#8a1f1f", fontSize: 12, marginTop: 2 }}>
-                              Not stocked at every location: {row.stockingError}. Open the product in Shopify and
-                              tick the missing location(s) under Inventory.
+                              Stock locations need checking: {row.stockingError}. Open the product in Shopify,
+                              check its locations under Inventory and tick any that are missing.
                             </div>
                           ) : row.stockedAt?.length ? (
                             <div style={{ color: "#777", fontSize: 12, marginTop: 2 }}>

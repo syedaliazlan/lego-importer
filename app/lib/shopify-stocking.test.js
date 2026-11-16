@@ -17,9 +17,14 @@ import fs from "node:fs";
 import {
   STOCKING_TRIES,
   THROTTLE_RETRIES,
+  checkProductExists,
+  createProduct,
   describeClientError,
+  duplicateCheckFailedMessage,
   getFirstVariant,
   leftoverDraftMessage,
+  mayHaveBeenApplied,
+  possibleDraftMessage,
   setUpNewVariant,
   stockAtAllLocations,
 } from "./shopify-product.server.js";
@@ -63,7 +68,7 @@ const activationReply = (locs, userErrors = []) => ({
  * Activation refuses with MISSING_SKU while the variant has no SKU, which is
  * what the 2026-10 InventoryBulkToggleActivationUserErrorCode allows.
  */
-function fakeStore({ skuEcho = true, trackedEcho = true, activation } = {}) {
+function fakeStore({ skuEcho = true, trackedEcho = true, activation, bulk } = {}) {
   const state = { sku: "", tracked: false, stocked: new Set([WEB.id]) };
   const steps = [];
   const admin = fakeAdmin((name, vars) => {
@@ -73,15 +78,14 @@ function fakeStore({ skuEcho = true, trackedEcho = true, activation } = {}) {
     }
     if (name === "productVariantsBulkUpdate") {
       const input = vars.variants[0];
-      if (input.inventoryItem?.sku !== undefined) {
-        steps.push("sku");
-        if (skuEcho) state.sku = input.inventoryItem.sku;
-      } else if (input.inventoryItem?.tracked !== undefined) {
-        steps.push("tracking");
-        if (trackedEcho) state.tracked = true;
-      } else {
-        steps.push("barcodes");
-      }
+      const kind =
+        input.inventoryItem?.sku !== undefined ? "sku" : input.inventoryItem?.tracked !== undefined ? "tracking" : "barcodes";
+      steps.push(kind);
+      // `bulk` may throw, or return a reply to send instead of applying the write.
+      const override = bulk?.(kind, input);
+      if (override) return override;
+      if (kind === "sku" && skuEcho) state.sku = input.inventoryItem.sku;
+      if (kind === "tracking" && trackedEcho) state.tracked = true;
       return {
         data: {
           productVariantsBulkUpdate: {
@@ -140,14 +144,41 @@ test("both importers set up the variant through setUpNewVariant and never stock 
 
 /* ---------- 2. retries ---------- */
 
-test("stocking path: every read and the activation ask the library for STOCKING_TRIES (network, 429, 503)", async () => {
+test("variant setup: every read and every absolute write ask the library for STOCKING_TRIES (network, 429, 503)", async () => {
   const { admin } = fakeStore();
   await setUpNewVariant(admin, { productId: PRODUCT, sku: "75192", barcodes: [], locations: LOCATIONS, wait: noWait });
-  const stockingCalls = admin.calls.filter((c) => ["getProduct", "ImportInventoryLevels", "ImportStockAtLocations"].includes(c.name));
-  assert.equal(stockingCalls.length, 3);
-  for (const c of stockingCalls) assert.equal(c.options.tries, STOCKING_TRIES, c.name);
+  assert.deepEqual(
+    admin.calls.map((c) => c.name),
+    ["getProduct", "productVariantsBulkUpdate", "productVariantsBulkUpdate", "productVariantsBulkUpdate", "ImportInventoryLevels", "ImportStockAtLocations"]
+  );
+  for (const c of admin.calls) assert.equal(c.options.tries, STOCKING_TRIES, c.name);
   // @shopify/graphql-client MAX_RETRIES is 3 and admin.graphql passes tries - 1.
   assert.ok(STOCKING_TRIES - 1 >= 1 && STOCKING_TRIES - 1 <= 3);
+});
+
+test("SKU write: THROTTLED is retried after a wait and the SKU lands", async () => {
+  let skuAttempts = 0;
+  const waits = [];
+  const { admin, state } = fakeStore({
+    bulk: (kind) => {
+      if (kind !== "sku") return undefined;
+      skuAttempts += 1;
+      if (skuAttempts === 1) throw graphqlQueryError(THROTTLED);
+      return undefined;
+    },
+  });
+  const r = await setUpNewVariant(admin, {
+    productId: PRODUCT,
+    sku: "75192",
+    barcodes: [],
+    locations: LOCATIONS,
+    wait: async (ms) => waits.push(ms),
+  });
+  assert.equal(skuAttempts, 2);
+  assert.deepEqual(waits, [1000]);
+  assert.equal(r.skuSet, true);
+  assert.equal(state.sku, "75192");
+  assert.deepEqual(r.warnings, []);
 });
 
 test("activation: THROTTLED is retried after a 1 s wait and then succeeds", async () => {
@@ -240,7 +271,7 @@ test("reply lost after the change was applied: the re-read finds every location 
   assert.equal(admin.calls.filter((c) => c.name === "ImportInventoryLevels").length, 2);
 });
 
-test("5xx after the library's retries, nothing applied: the row names every missing location", async () => {
+test("HttpMaxRetriesError (a 500, which the library does not retry, or a 429/503 still failing after its retries), nothing applied: the row names every missing location", async () => {
   const { admin } = fakeStore({
     activation: () => {
       throw httpMaxRetriesError();
@@ -275,6 +306,46 @@ test("payload leaves a location out with no userError: the re-read decides, and 
   const r = await stockAtAllLocations(admin, { inventoryItemId: ITEM, locations: LOCATIONS, wait: noWait });
   assert.equal(r.ok, false);
   assert.equal(r.message, "stocked at warehouse, Aylesbury; NOT stocked at Glasgow");
+});
+
+test("reply lost AND the re-read fails: the outcome is unknown, never reported as NOT stocked", async () => {
+  let levelReads = 0;
+  const admin = fakeAdmin((name) => {
+    if (name === "ImportInventoryLevels") {
+      levelReads += 1;
+      if (levelReads === 1) return levelsReply([WEB]);
+      throw graphqlQueryError(THROTTLED);
+    }
+    if (name === "ImportStockAtLocations") throw new Error("Http request error, no response available: fetch failed");
+    throw new Error(`unexpected ${name}`);
+  });
+  const r = await stockAtAllLocations(admin, { inventoryItemId: ITEM, locations: LOCATIONS, wait: noWait });
+  assert.equal(r.ok, false);
+  assert.deepEqual(r.failed, []);
+  assert.deepEqual(r.unknown.map((l) => l.name), ["Aylesbury", "Glasgow"]);
+  assert.equal(
+    r.message,
+    "stocked at warehouse; UNKNOWN at Aylesbury, Glasgow, check them in Shopify " +
+      "(Shopify said: Http request error, no response available: fetch failed; re-check failed: Throttled)"
+  );
+});
+
+test("payload confirms one location, then the re-read fails: that one is stocked, the rest unknown", async () => {
+  let levelReads = 0;
+  const admin = fakeAdmin((name) => {
+    if (name === "ImportInventoryLevels") {
+      levelReads += 1;
+      if (levelReads === 1) return levelsReply([WEB]);
+      throw httpMaxRetriesError();
+    }
+    if (name === "ImportStockAtLocations") return activationReply([AYL]);
+    throw new Error(`unexpected ${name}`);
+  });
+  const r = await stockAtAllLocations(admin, { inventoryItemId: ITEM, locations: LOCATIONS, wait: noWait });
+  assert.equal(r.ok, false);
+  assert.deepEqual(r.activated.map((l) => l.name), ["Aylesbury"]);
+  assert.deepEqual(r.unknown.map((l) => l.name), ["Glasgow"]);
+  assert.match(r.message, /^stocked at warehouse, Aylesbury; UNKNOWN at Glasgow, check them in Shopify \(re-check failed: /);
 });
 
 test("levels cannot be read: nothing is activated and the row says why", async () => {
@@ -344,6 +415,143 @@ test("setUpNewVariant: SKU and tracking that did not take are returned as row wa
   // With no SKU the fake store refuses with MISSING_SKU, and the row says so.
   assert.equal(r.stocking.ok, false);
   assert.match(r.stocking.message, /NOT stocked at Aylesbury, Glasgow \(Shopify said: Cannot stock .* missing a SKU\.\)/);
+});
+
+test("setUpNewVariant: a barcode write that fails is a row warning naming the barcodes", async () => {
+  const { admin } = fakeStore({
+    bulk: (kind) =>
+      kind === "barcodes"
+        ? { data: { productVariantsBulkUpdate: { productVariants: [], userErrors: [{ field: ["barcodes"], message: "Barcode is invalid" }] } } }
+        : undefined,
+  });
+  const r = await setUpNewVariant(admin, {
+    productId: PRODUCT,
+    sku: "75192",
+    barcodes: [
+      { value: "5702017155364", type: "EAN_13" },
+      { value: "673419340526", type: "UPC_A" },
+    ],
+    locations: LOCATIONS,
+    wait: noWait,
+  });
+  assert.equal(r.ok, true);
+  assert.equal(r.barcodesWritten, false);
+  assert.deepEqual(r.warnings, [
+    "barcodes not written: add 5702017155364, 673419340526 to the variant in Shopify, or the tills cannot scan it",
+  ]);
+  assert.equal(r.stocking.ok, true, "the rest of the setup still runs");
+});
+
+test("setUpNewVariant: with no barcode to write, a failed policy-only write needs no warning (DENY is the default)", async () => {
+  const { admin } = fakeStore({
+    bulk: (kind) => {
+      if (kind === "barcodes") throw httpMaxRetriesError();
+      return undefined;
+    },
+  });
+  const r = await setUpNewVariant(admin, { productId: PRODUCT, sku: "75192", barcodes: [], locations: LOCATIONS, wait: noWait });
+  assert.equal(r.barcodesWritten, true);
+  assert.deepEqual(r.warnings, []);
+});
+
+/* ---------- duplicate check (fail closed) ---------- */
+
+const productsReply = (nodes) => ({ data: { products: { edges: nodes.map((node) => ({ node })) } } });
+
+test("checkProductExists: found, not found, both marked checked, with retries asked for", async () => {
+  const found = fakeAdmin(() => productsReply([{ id: PRODUCT, title: "Set", status: "ACTIVE", variants: { edges: [] } }]));
+  assert.deepEqual(await checkProductExists(found, "75192", { wait: noWait }), {
+    checked: true,
+    exists: true,
+    productId: PRODUCT,
+    title: "Set",
+    status: "ACTIVE",
+  });
+  assert.equal(found.calls[0].options.tries, STOCKING_TRIES);
+  assert.deepEqual(found.calls[0].variables, { query: "sku:75192" });
+
+  const none = fakeAdmin(() => productsReply([]));
+  assert.deepEqual(await checkProductExists(none, "75192", { wait: noWait }), { checked: true, exists: false });
+});
+
+test("checkProductExists: one THROTTLED reply is retried, so it neither skips nor fails open", async () => {
+  const admin = fakeAdmin((name, vars, calls) => {
+    if (calls.length === 1) throw graphqlQueryError(THROTTLED);
+    return productsReply([]);
+  });
+  assert.deepEqual(await checkProductExists(admin, "75192", { wait: noWait }), { checked: true, exists: false });
+  assert.equal(admin.calls.length, 2);
+});
+
+test("checkProductExists: a check that still fails comes back unchecked (fail closed), never as not found", async () => {
+  const throttledAlways = fakeAdmin(() => {
+    throw graphqlQueryError(THROTTLED);
+  });
+  assert.deepEqual(await checkProductExists(throttledAlways, "75192", { wait: noWait }), {
+    checked: false,
+    exists: false,
+    error: "Throttled",
+  });
+  assert.equal(throttledAlways.calls.length, THROTTLE_RETRIES + 1);
+
+  const denied = fakeAdmin(() => {
+    throw graphqlQueryError([{ message: "Access denied", extensions: { code: "ACCESS_DENIED" } }]);
+  });
+  assert.equal((await checkProductExists(denied, "75192", { wait: noWait })).checked, false);
+  assert.equal(denied.calls.length, 1, "only THROTTLED is retried");
+});
+
+test("duplicateCheckFailedMessage: says nothing was created and to import again", () => {
+  assert.equal(
+    duplicateCheckFailedMessage({ sku: "75192", importId: "75192-1", error: "Throttled" }),
+    'Not imported: could not check whether a product with SKU "75192" already exists (Throttled). Nothing was created. Import 75192-1 again.'
+  );
+});
+
+/* ---------- productCreate: sent once, may-exist warning ---------- */
+
+const PRODUCT_INPUT = { title: "Millennium Falcon 75192 | Star Wars | LEGO", status: "DRAFT" };
+
+test("createProduct: sent once with no retries asked for", async () => {
+  const admin = fakeAdmin(() => ({
+    data: { productCreate: { product: { id: PRODUCT, title: PRODUCT_INPUT.title, status: "DRAFT", publishedAt: null }, userErrors: [] } },
+  }));
+  const r = await createProduct(admin, PRODUCT_INPUT, "t");
+  assert.deepEqual(r, { ok: true, productId: PRODUCT, title: PRODUCT_INPUT.title });
+  assert.equal(admin.calls.length, 1);
+  assert.equal(admin.calls[0].options.tries, undefined, "a re-send could create a second product");
+});
+
+test("createProduct: no reply or a 5xx may have created it; a refusal did not", async () => {
+  const cases = [
+    [new Error("Http request error, no response available: fetch failed"), true],
+    [httpErrorResponse(502), true],
+    [httpMaxRetriesError(), true],
+    [graphqlQueryError([{ message: "Internal error", extensions: { code: "INTERNAL_SERVER_ERROR" } }]), true],
+    [graphqlQueryError(THROTTLED), false],
+    [graphqlQueryError([{ message: "Query cost is 2003", extensions: { code: "MAX_COST_EXCEEDED" } }]), false],
+    [httpErrorResponse(429), false],
+    [httpErrorResponse(401), false],
+  ];
+  for (const [thrown, mayExist] of cases) {
+    assert.equal(mayHaveBeenApplied(thrown), mayExist, describeClientError(thrown));
+    const admin = fakeAdmin(() => {
+      throw thrown;
+    });
+    const r = await createProduct(admin, PRODUCT_INPUT, "t");
+    assert.equal(r.ok, false);
+    assert.equal(admin.calls.length, 1, "never re-sent");
+    assert.equal(r.errorCode, mayExist ? "PRODUCT_CREATE_UNCONFIRMED" : "PRODUCT_CREATE_ERROR");
+    assert.equal(Boolean(r.mayExist), mayExist);
+  }
+});
+
+test("possibleDraftMessage: warns a draft may exist and says to search before importing again", () => {
+  assert.equal(
+    possibleDraftMessage({ title: PRODUCT_INPUT.title, importId: "75192-1", reason: "fetch failed" }),
+    'Shopify did not confirm the product was created (fetch failed), so a draft "Millennium Falcon 75192 | Star Wars | LEGO" may already exist. ' +
+      "Search Shopify for that title before importing 75192-1 again, or it may be created twice."
+  );
 });
 
 /* ---------- 5. errors as the real library throws them ---------- */

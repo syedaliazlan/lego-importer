@@ -18,6 +18,7 @@ import {
   activationUpdates,
   activeLocationIdsFromLevels,
   describeStockingFailure,
+  describeStockingUnknown,
   locationName,
   locationsToActivate,
   nonZeroAvailable,
@@ -51,27 +52,36 @@ export function describeClientError(err) {
   return String(message ?? "").trim() || "Unknown error";
 }
 
-// Retries for the reads and the activation on the stocking path, from the
+// Retries for the reads and the writes that are safe to send twice, from the
 // installed library source:
 //   - admin.graphql(doc, { tries }) passes `tries - 1` as `retries`
 //     (@shopify/shopify-app-react-router dist/esm/server/clients/admin/graphql.mjs).
 //   - @shopify/graphql-client dist/graphql-client/http-fetch.mjs retries ONLY
 //     when fetch itself throws (network) or the HTTP status is 429 or 503
 //     (RETRIABLE_STATUS_CODES), waiting Retry-After or 1 s. Every other reply,
-//     including a 200 with GraphQL errors, is returned without a retry.
-//     MAX_RETRIES is 3, so `tries` may be at most 4 (validateRetries throws
-//     otherwise).
-//   - The Admin GraphQL API reports rate limiting as 200 OK with a THROTTLED
-//     error, never 429 (shopify.dev/docs/api/usage/response-codes), so the
-//     library does not retry it. A throttled request is refused before it runs
-//     ("Before execution begins, an app's bucket must have enough capacity for
-//     the requested cost", shopify.dev/docs/apps/build/apis/graphql-admin/rate-limits),
-//     so it is retried here after the 1 s backoff shopify.dev/docs/api/usage/limits
+//     including a 500 and a 200 with GraphQL errors, is returned without a
+//     retry. MAX_RETRIES is 3, so `tries` may be at most 4 (validateRetries
+//     throws otherwise).
+//   - The Admin GraphQL API reports query-cost rate limiting as 200 OK with a
+//     THROTTLED error, not 429 (shopify.dev/docs/api/usage/response-codes);
+//     a 429 is kept for resource-based limits, such as productCreate,
+//     productUpdate and productVariantsBulkCreate once a store has 500,000
+//     variants (shopify.dev/docs/apps/build/apis/graphql-admin/rate-limits).
+//     The library does not retry THROTTLED. A throttled request is refused
+//     before it runs ("Before execution begins, an app's bucket must have
+//     enough capacity for the requested cost", same rate-limits page), so it
+//     is retried here after the 1 s backoff shopify.dev/docs/api/usage/limits
 //     recommends.
-// Repeating the activation is safe: it only ever sends activate:true, for
-// locations a product created moments earlier was missing, so a repeat can
-// only reach levels the first attempt created at zero on a product nobody has
-// stocked yet.
+// Only reads and absolute writes go through here, because a lost reply means
+// the same request is sent again:
+//   - inventoryBulkToggleActivation only ever sends activate:true, for
+//     locations a product created moments earlier was missing, so a repeat can
+//     only reach levels the first attempt created at zero.
+//   - productVariantsBulkUpdate here only sets values outright: the SKU,
+//     tracked: true, inventoryPolicy DENY, and `barcodes`, which "Replaces the
+//     entire barcode set" (2026-10 ProductVariantsBulkInput). Sending one twice
+//     leaves the same result.
+// productCreate never goes through here: a repeat would make a second product.
 export const STOCKING_TRIES = 3;
 export const THROTTLE_RETRIES = 2;
 const THROTTLE_WAIT_MS = 1000;
@@ -115,11 +125,13 @@ export const ACTION_FIGURES_CATEGORY_ID = "gid://shopify/TaxonomyCategory/tg-5-8
 
 /**
  * Find an existing product by variant SKU.
- * Fails open: if the query itself errors we report "not found" rather than
- * blocking the import.
- * @returns {Promise<{exists: boolean, productId?: string, title?: string, status?: string, error?: string}>}
+ * Retries like the stocking reads. If the check still fails it fails CLOSED:
+ * `checked` is false and the caller skips the item, because importing blind
+ * could create a second copy of a product the shop already has.
+ * @param {{wait?: (ms: number) => Promise<void>}} [opts]
+ * @returns {Promise<{checked: true, exists: boolean, productId?: string, title?: string, status?: string} | {checked: false, exists: false, error: string}>}
  */
-export async function checkProductExists(admin, sku) {
+export async function checkProductExists(admin, sku, opts = {}) {
   const query = `
     query checkProductBySku($query: String!) {
       products(first: 1, query: $query) {
@@ -136,23 +148,35 @@ export async function checkProductExists(admin, sku) {
   `;
 
   try {
-    const resp = await admin.graphql(query, { variables: { query: `sku:${sku}` } });
-    const json = await resp.json();
+    const json = await requestWithRetries(admin, query, { query: `sku:${sku}` }, opts);
 
-    const product = json.data?.products?.edges?.[0]?.node;
+    const product = json?.data?.products?.edges?.[0]?.node;
     if (product) {
       return {
+        checked: true,
         exists: true,
         productId: product.id,
         title: product.title,
         status: product.status,
       };
     }
-    return { exists: false };
+    return { checked: true, exists: false };
   } catch (err) {
-    console.warn(`Could not check for existing product with SKU ${sku}:`, err.message);
-    return { exists: false, error: err.message };
+    const error = describeClientError(err);
+    console.warn(`Could not check for existing product with SKU ${sku}:`, error);
+    return { checked: false, exists: false, error };
   }
+}
+
+/**
+ * Row text for an item skipped because the duplicate check failed.
+ * @param {{sku: string, importId: string, error: string}} args
+ */
+export function duplicateCheckFailedMessage({ sku, importId, error }) {
+  return (
+    `Not imported: could not check whether a product with SKU "${sku}" already exists (${error}). ` +
+    `Nothing was created. Import ${importId} again.`
+  );
 }
 
 /**
@@ -197,9 +221,47 @@ function isMissingMetafieldDefinition(error) {
   );
 }
 
+// GraphQL error codes Shopify returns before a request runs: both are cost
+// checks made "Before execution begins" / "enforced before a query is
+// executed" (shopify.dev/docs/apps/build/apis/graphql-admin/rate-limits).
+const REFUSED_BEFORE_RUNNING = new Set(["THROTTLED", "MAX_COST_EXCEEDED"]);
+
 /**
- * Create a product.
- * @returns {Promise<{ok: true, productId: string, title: string} | {ok: false, errorCode: string, message: string}>}
+ * Whether a request that threw may still have been carried out by Shopify.
+ * Only a refusal is certain to have changed nothing: a 4xx status (rethrown as
+ * a Response) or a 200 whose GraphQL errors are all cost refusals. No reply
+ * at all (network), a 5xx, any other GraphQL error (an INTERNAL_SERVER_ERROR
+ * is "returned instead of 500 Internal Server Error", and an access error can
+ * come from a field read after the change) or anything unexpected may have
+ * come after the work was done.
+ * @param {unknown} err what admin.graphql threw
+ */
+export function mayHaveBeenApplied(err) {
+  if (typeof Response !== "undefined" && err instanceof Response) return err.status >= 500;
+  const graphQLErrors = err?.body?.errors?.graphQLErrors;
+  if (Array.isArray(graphQLErrors) && graphQLErrors.length) {
+    return !graphQLErrors.every((e) => REFUSED_BEFORE_RUNNING.has(e?.extensions?.code));
+  }
+  return true;
+}
+
+/**
+ * Row text when productCreate threw in a way that may have come after Shopify
+ * created the product, so a draft may exist that this run cannot see.
+ * @param {{title: string, importId: string, reason: string}} args
+ */
+export function possibleDraftMessage({ title, importId, reason }) {
+  return (
+    `Shopify did not confirm the product was created (${reason}), so a draft "${title}" may already exist. ` +
+    `Search Shopify for that title before importing ${importId} again, or it may be created twice.`
+  );
+}
+
+/**
+ * Create a product. Sent ONCE, with no retries: a repeat after a lost reply
+ * would create a second product. Never throws.
+ * @returns {Promise<{ok: true, productId: string, title: string} |
+ *   {ok: false, errorCode: string, message: string, mayExist?: boolean, reason?: string}>}
  */
 export async function createProduct(admin, productInput, label = "") {
   // `product: ProductCreateInput` replaces the deprecated `input: ProductInput`
@@ -215,16 +277,26 @@ export async function createProduct(admin, productInput, label = "") {
     }
   `;
 
-  const resp = await admin.graphql(mutation, { variables: { product: productInput } });
-  const json = await resp.json();
-
-  if (json.errors) {
-    const message = json.errors[0]?.message || "Unknown GraphQL error";
-    console.error(`[${label}] Product creation GraphQL error:`, message);
-    return { ok: false, errorCode: "PRODUCT_CREATE_ERROR", message: `Failed to create product: ${message}` };
+  let json;
+  try {
+    const resp = await admin.graphql(mutation, { variables: { product: productInput } });
+    json = await resp.json();
+  } catch (err) {
+    const reason = describeClientError(err);
+    console.error(`[${label}] Product creation failed:`, reason);
+    if (mayHaveBeenApplied(err)) {
+      return {
+        ok: false,
+        errorCode: "PRODUCT_CREATE_UNCONFIRMED",
+        message: `Failed to create product: ${reason}`,
+        mayExist: true,
+        reason,
+      };
+    }
+    return { ok: false, errorCode: "PRODUCT_CREATE_ERROR", message: `Failed to create product: ${reason}` };
   }
 
-  const productCreate = json.data?.productCreate;
+  const productCreate = json?.data?.productCreate;
   if (!productCreate) {
     return {
       ok: false,
@@ -339,28 +411,21 @@ const VARIANTS_BULK_UPDATE = `
   }
 `;
 
-// Non fatal by contract: log and report, never throw.
-async function bulkUpdateVariant(admin, productId, variantInput, label, what) {
+// Non fatal by contract: log and report, never throw. Every input sent here
+// sets values outright, so it goes through requestWithRetries (see there).
+async function bulkUpdateVariant(admin, productId, variantInput, label, what, opts = {}) {
   try {
-    const resp = await admin.graphql(VARIANTS_BULK_UPDATE, {
-      variables: { productId, variants: [variantInput] },
-    });
-    const json = await resp.json();
+    const json = await requestWithRetries(admin, VARIANTS_BULK_UPDATE, { productId, variants: [variantInput] }, opts);
 
-    if (json.errors) {
-      console.error(`[${label}] ${what} error:`, json.errors[0]?.message || "Unknown error");
-      return null;
-    }
-
-    const userErrors = json.data?.productVariantsBulkUpdate?.userErrors || [];
+    const userErrors = json?.data?.productVariantsBulkUpdate?.userErrors || [];
     if (userErrors.length > 0) {
       console.error(`[${label}] ${what} failed:`, userErrors[0]?.message || "Unknown error");
       return null;
     }
 
-    return json.data?.productVariantsBulkUpdate?.productVariants?.[0] || null;
+    return json?.data?.productVariantsBulkUpdate?.productVariants?.[0] || null;
   } catch (err) {
-    console.error(`[${label}] ${what} failed:`, err.message);
+    console.error(`[${label}] ${what} failed:`, describeClientError(err));
     return null;
   }
 }
@@ -383,30 +448,38 @@ async function bulkUpdateVariant(admin, productId, variantInput, label, what) {
  *   https://shopify.dev/docs/api/admin-graphql/2026-10/input-objects/ProductVariantsBulkInput
  *   https://shopify.dev/docs/api/admin-graphql/2026-10/input-objects/BarcodeInput
  *
+ * inventoryPolicy "Defaults to `DENY`" on the same input, so sending it only
+ * makes sure; a failed write leaves it at that default.
+ *
  * @param {Array<{value: string, type?: string|null}>} [barcodes]
+ * @returns {Promise<object|null>} the updated variant, or null when the write failed
  */
-export async function updateVariantFields(admin, { productId, variantId, barcodes, label = "" }) {
-  const rows = (barcodes || [])
-    .filter((b) => b && String(b.value ?? "").trim())
-    .map((b) => ({ value: String(b.value).trim(), type: b.type || null }));
-
+export async function updateVariantFields(admin, { productId, variantId, barcodes, label = "", wait }) {
   const input = { id: variantId, inventoryPolicy: "DENY" };
+  const rows = barcodeRows(barcodes);
   if (rows.length) input.barcodes = rows;
 
-  return bulkUpdateVariant(admin, productId, input, label, "Variant update");
+  return bulkUpdateVariant(admin, productId, input, label, "Variant update", wait ? { wait } : {});
+}
+
+function barcodeRows(barcodes) {
+  return (barcodes || [])
+    .filter((b) => b && String(b.value ?? "").trim())
+    .map((b) => ({ value: String(b.value).trim(), type: b.type || null }));
 }
 
 /**
  * Turn on inventory tracking for the variant.
  * @returns {Promise<boolean>} whether tracking is on
  */
-export async function enableInventoryTracking(admin, { productId, variantId, label = "" }) {
+export async function enableInventoryTracking(admin, { productId, variantId, label = "", wait }) {
   const variant = await bulkUpdateVariant(
     admin,
     productId,
     { id: variantId, inventoryItem: { tracked: true } },
     label,
-    "Inventory tracking update"
+    "Inventory tracking update",
+    wait ? { wait } : {}
   );
   return Boolean(variant?.inventoryItem?.tracked);
 }
@@ -537,12 +610,15 @@ async function readActiveLocationIds(admin, inventoryItemId, opts) {
  *   activated: Array<{id: string, name: string}>,
  *   alreadyActive: Array<{id: string, name: string}>,
  *   failed: Array<{id: string, name: string}>,
+ *   unknown: Array<{id: string, name: string}>,
  *   nonZero: Array<{locationId: string, quantity: number}>,
  *   message: string|null,
  * }>}
+ * `unknown` lists locations whose outcome could not be confirmed (reply and
+ * re-read both failed); they are never reported as not stocked.
  */
 export async function stockAtAllLocations(admin, { inventoryItemId, locations, label = "", wait }) {
-  const result = { ok: false, activated: [], alreadyActive: [], failed: [], nonZero: [], message: null };
+  const result = { ok: false, activated: [], alreadyActive: [], failed: [], unknown: [], nonZero: [], message: null };
   const opts = wait ? { wait } : {};
 
   if (!inventoryItemId) {
@@ -587,21 +663,30 @@ export async function stockAtAllLocations(admin, { inventoryItemId, locations, l
     problem = describeClientError(err);
   }
 
+  if (result.nonZero.length) {
+    console.warn(`[${label}] activated levels with non-zero available:`, result.nonZero);
+  }
+
   // The payload's inventoryLevels are "The activated inventory levels".
   let stockedNow = returned;
   if (plan.toActivate.some((l) => !returned.has(l.id))) {
     try {
       stockedNow = await readActiveLocationIds(admin, inventoryItemId, opts);
     } catch (err) {
-      console.error(`[${label}] could not re-read the stock locations:`, describeClientError(err));
+      // Neither the reply nor a fresh read says where the rest stand. They
+      // may well be stocked (a lost reply often follows a change that was
+      // made), so do not claim they are not: say it is unknown.
+      const recheckError = describeClientError(err);
+      result.activated = plan.toActivate.filter((l) => returned.has(l.id));
+      result.unknown = plan.toActivate.filter((l) => !returned.has(l.id));
+      result.message = describeStockingUnknown({ ...result, problem, recheckError });
+      console.error(`[${label}] ${result.message}`);
+      return result;
     }
   }
   result.activated = plan.toActivate.filter((l) => stockedNow.has(l.id));
   result.failed = plan.toActivate.filter((l) => !stockedNow.has(l.id));
 
-  if (result.nonZero.length) {
-    console.warn(`[${label}] activated levels with non-zero available:`, result.nonZero);
-  }
   if (!result.failed.length) {
     if (problem) console.warn(`[${label}] activation reported "${problem}" but every location is stocked`);
     result.ok = true;
@@ -625,13 +710,14 @@ export async function stockAtAllLocations(admin, { inventoryItemId, locations, l
  *   https://shopify.dev/docs/api/admin-graphql/2026-10/input-objects/InventoryItemInput
  * @returns {Promise<boolean>} whether the SKU now matches
  */
-export async function setVariantSku(admin, { productId, variantId, sku, label = "" }) {
+export async function setVariantSku(admin, { productId, variantId, sku, label = "", wait }) {
   const variant = await bulkUpdateVariant(
     admin,
     productId,
     { id: variantId, inventoryItem: { sku } },
     label,
-    "SKU update"
+    "SKU update",
+    wait ? { wait } : {}
   );
   if (variant?.sku !== sku) {
     console.error(`[${label}] SKU not set. Expected: ${sku}, Got: ${variant?.sku || "null"}`);
@@ -655,14 +741,15 @@ export async function setVariantSku(admin, { productId, variantId, sku, label = 
  *      https://shopify.dev/docs/api/admin-graphql/2026-10/enums/InventoryBulkToggleActivationUserErrorCode
  *   4. inventory tracking
  *   5. stock at every location at zero
- * Never throws. A SKU or tracking step that did not take is returned in
- * `warnings` for the result row, because staff must fix it by hand.
+ * Never throws. A barcode, SKU or tracking write that did not take is
+ * returned in `warnings` for the result row, because staff must fix it by
+ * hand.
  *
  * @param {{productId: string, sku: string, barcodes: Array<{value: string, type?: string|null}>,
  *   locations: Array<{id: string, name: string}>, label?: string, wait?: (ms: number) => Promise<void>}} args
  * @returns {Promise<{ok: false, errorCode: string, message: string} | {
- *   ok: true, variantId: string, inventoryItemId?: string, skuSet: boolean, tracked: boolean,
- *   stocking: Awaited<ReturnType<typeof stockAtAllLocations>>, warnings: string[] }>}
+ *   ok: true, variantId: string, inventoryItemId?: string, barcodesWritten: boolean, skuSet: boolean,
+ *   tracked: boolean, stocking: Awaited<ReturnType<typeof stockAtAllLocations>>, warnings: string[] }>}
  */
 export async function setUpNewVariant(admin, { productId, sku, barcodes, locations, label = "", wait }) {
   const opts = wait ? { wait } : {};
@@ -671,10 +758,19 @@ export async function setUpNewVariant(admin, { productId, sku, barcodes, locatio
   if (!variant.ok) return variant;
   const { variantId, inventoryItemId } = variant;
 
-  await updateVariantFields(admin, { productId, variantId, barcodes, label });
-
   const warnings = [];
-  const skuSet = await setVariantSku(admin, { productId, variantId, sku, label });
+  const wanted = barcodeRows(barcodes);
+  const fields = await updateVariantFields(admin, { productId, variantId, barcodes, label, ...opts });
+  // With no barcode to write, the call only re-states inventoryPolicy DENY,
+  // which is already the default, so a failure there needs no warning.
+  const barcodesWritten = Boolean(fields) || !wanted.length;
+  if (!barcodesWritten) {
+    warnings.push(
+      `barcodes not written: add ${wanted.map((b) => b.value).join(", ")} to the variant in Shopify, or the tills cannot scan it`
+    );
+  }
+
+  const skuSet = await setVariantSku(admin, { productId, variantId, sku, label, ...opts });
   if (!skuSet) {
     warnings.push(`SKU not set: set it to ${sku} in Shopify, otherwise a re-import cannot see this product and will make a duplicate`);
   }
@@ -685,16 +781,17 @@ export async function setUpNewVariant(admin, { productId, sku, barcodes, locatio
     activated: [],
     alreadyActive: [],
     failed: [],
+    unknown: [],
     nonZero: [],
     message: "variant has no inventory item",
   };
   if (inventoryItemId) {
-    tracked = await enableInventoryTracking(admin, { productId, variantId, label });
+    tracked = await enableInventoryTracking(admin, { productId, variantId, label, ...opts });
     if (!tracked) warnings.push("inventory tracking is off: open the variant in Shopify and tick Track quantity");
     stocking = await stockAtAllLocations(admin, { inventoryItemId, locations, label, ...opts });
   }
 
-  return { ok: true, variantId, inventoryItemId, skuSet, tracked, stocking, warnings };
+  return { ok: true, variantId, inventoryItemId, barcodesWritten, skuSet, tracked, stocking, warnings };
 }
 
 /* ===============================================================
