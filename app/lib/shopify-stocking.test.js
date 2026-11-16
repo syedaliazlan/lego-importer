@@ -526,6 +526,7 @@ test("createProduct: no reply or a 5xx may have created it; a refusal did not", 
   const cases = [
     [new Error("Http request error, no response available: fetch failed"), true],
     [httpErrorResponse(502), true],
+    [httpErrorResponse(200), true],
     [httpMaxRetriesError(), true],
     [graphqlQueryError([{ message: "Internal error", extensions: { code: "INTERNAL_SERVER_ERROR" } }]), true],
     [graphqlQueryError(THROTTLED), false],

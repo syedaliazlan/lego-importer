@@ -230,14 +230,17 @@ const REFUSED_BEFORE_RUNNING = new Set(["THROTTLED", "MAX_COST_EXCEEDED"]);
  * Whether a request that threw may still have been carried out by Shopify.
  * Only a refusal is certain to have changed nothing: a 4xx status (rethrown as
  * a Response) or a 200 whose GraphQL errors are all cost refusals. No reply
- * at all (network), a 5xx, any other GraphQL error (an INTERNAL_SERVER_ERROR
- * is "returned instead of 500 Internal Server Error", and an access error can
- * come from a field read after the change) or anything unexpected may have
- * come after the work was done.
+ * at all (network), a 5xx, a 200 whose body was cut off or was not JSON (the
+ * library rethrows that as a Response with status 200), any other GraphQL
+ * error (an INTERNAL_SERVER_ERROR is "returned instead of 500 Internal Server
+ * Error", and an access error can come from a field read after the change) or
+ * anything unexpected may have come after the work was done.
  * @param {unknown} err what admin.graphql threw
  */
 export function mayHaveBeenApplied(err) {
-  if (typeof Response !== "undefined" && err instanceof Response) return err.status >= 500;
+  if (typeof Response !== "undefined" && err instanceof Response) {
+    return !(err.status >= 400 && err.status < 500);
+  }
   const graphQLErrors = err?.body?.errors?.graphQLErrors;
   if (Array.isArray(graphQLErrors) && graphQLErrors.length) {
     return !graphQLErrors.every((e) => REFUSED_BEFORE_RUNNING.has(e?.extensions?.code));
